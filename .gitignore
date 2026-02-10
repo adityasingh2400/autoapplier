@@ -1,0 +1,56 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment and secrets (never commit real keys)
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Personal data and local memory (resumes, profile, applications)
+real_memory/
+test_memory/
+memory/
+
+# OpenClaw credentials (stored under ~/.openclaw; exclude if ever in repo)
+.openclaw/
+*credentials*.json
+*gmail_client_secret*.json
+*gmail_tokens/
+token_*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Playwright / browsers (optional; uncomment if you install in repo)
+# playwright-reports/
+# test-results/

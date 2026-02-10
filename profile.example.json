@@ -1,0 +1,27 @@
+{
+  "identity": {
+    "name": "Your Full Name",
+    "email": "your.email@example.com",
+    "alternateEmail": "alternate@example.com",
+    "linkedin": "https://www.linkedin.com/in/yourprofile",
+    "github": "https://github.com/yourusername",
+    "phone": "5551234567"
+  },
+  "headline": "Short headline (e.g. CS student, SWE, …)",
+  "school": "Your University",
+  "jobPreferences": {
+    "targetRoles": ["SWE Intern", "Backend Intern"],
+    "companyTypes": ["startups", "remote-friendly"],
+    "comp": "Flexible"
+  },
+  "applicationDefaults": {
+    "questionBank": [
+      { "patterns": ["how did you hear", "where did you hear", "source"], "answer": "{how_heard}" },
+      { "patterns": ["email"], "answer": "{email}" },
+      { "patterns": ["phone", "mobile"], "answer": "{phone}" },
+      { "patterns": ["linkedin"], "answer": "{linkedin}" },
+      { "patterns": ["github", "website", "portfolio"], "answer": "{github}" },
+      { "patterns": ["work authorization", "visa sponsorship"], "answer": "__HUMAN__" }
+    ]
+  }
+}
