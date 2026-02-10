@@ -417,6 +417,30 @@ def _generate_password(policy: PasswordPolicy) -> str:
     return "".join(chars)
 
 
+# ---------------------------------------------------------------------------
+# Universal password pool  (12 chars, upper + lower + digit + special).
+# These satisfy virtually every site's requirements on the first try.
+# Only fall back to dynamic _generate_password if ALL of these fail.
+# ---------------------------------------------------------------------------
+_UNIVERSAL_PASSWORDS: list[str] = [
+    "Kx9$mTqL2wZp",
+    "Rv3!nBhJ7eFd",
+    "Wz8@cYgP4sQm",
+    "Hj5#kDxN1vLt",
+    "Bf6&rUmC9wXa",
+]
+
+_pw_index = 0
+
+
+def _next_universal_password() -> str:
+    """Return the next password from the universal pool (round-robin)."""
+    global _pw_index
+    pw = _UNIVERSAL_PASSWORDS[_pw_index % len(_UNIVERSAL_PASSWORDS)]
+    _pw_index += 1
+    return pw
+
+
 async def _extract_password_rule_text(page: Any) -> str:
     evaluate_fn = getattr(page, "evaluate", None)
     if evaluate_fn is None:
@@ -760,52 +784,86 @@ async def _attempt_email_verification_via_gmail(
 
 
 async def _attempt_login(page: Any, *, email: str, password: str) -> bool:
-    await _fill_all_matching(
-        page,
-        "input[type='email'], input[name*='email' i], input[id*='email' i], input[autocomplete='username'], input[name*='username' i], input[id*='username' i]",
-        email,
-    )
-    await smart_fill(
-        page,
-        prompt="",
-        value=email,
-        selectors=["input[type='email']", "input[name*='email' i]", "input[id*='email' i]"],
-        prefer_prompt=False,
-    )
+    # ---- Workday fast-path ----
+    workday = await page.locator('[data-automation-id="email"]').count() > 0
 
-    # Some flows require continuing after email; don't click if password is already visible.
-    if not await _has_password_inputs(page):
+    if workday:
+        # Make sure we're on the Sign In form, not the Create Account form.
+        # The Create Account form has a verifyPassword field.
+        on_signup = await page.locator('[data-automation-id="verifyPassword"]').count() > 0
+        if on_signup:
+            logger.warning("Login: Workday layout detected but page is the Create Account form, not Sign In")
+            # Try clicking Sign In link to switch views
+            sign_in_link = page.locator('[data-automation-id="signInLink"]')
+            if await sign_in_link.count() > 0:
+                await sign_in_link.first.click(force=True, timeout=3000)
+                await _wait_brief(page, 1000)
+            else:
+                return False
+
+        logger.info("Login: detected Workday layout, using data-automation-id selectors")
+        email_field = page.locator('[data-automation-id="email"]')
+        await email_field.click(timeout=2000)
+        await email_field.fill(email, timeout=2000)
+
+        pw_field = page.locator('[data-automation-id="password"]')
+        await pw_field.click(timeout=2000)
+        await pw_field.fill("", timeout=1000)
+        await pw_field.type(password, delay=30, timeout=10000)
+
+        # Workday login submit — try signInSubmitButton first, fall back to generic
+        for aid in ["signInSubmitButton", "signInLink"]:
+            btn = page.locator(f'[data-automation-id="{aid}"]')
+            if await btn.count() > 0:
+                await btn.first.click(force=True, timeout=3000)
+                break
+    else:
+        # ---- Generic path ----
+        await _fill_all_matching(
+            page,
+            "input[type='email'], input[name*='email' i], input[id*='email' i], input[autocomplete='username'], input[name*='username' i], input[id*='username' i]",
+            email,
+        )
+        await smart_fill(
+            page,
+            prompt="",
+            value=email,
+            selectors=["input[type='email']", "input[name*='email' i]", "input[id*='email' i]"],
+            prefer_prompt=False,
+        )
+
+        if not await _has_password_inputs(page):
+            await smart_click(
+                page,
+                prompt=None,
+                selectors=["button:has-text('Continue')", "button:has-text('Next')"],
+                text_candidates=["Continue", "Next"],
+                prefer_prompt=False,
+            )
+            await _wait_brief(page, 650)
+
+        await _fill_all_matching(page, "input[type='password']", password)
+        await smart_fill(
+            page,
+            prompt="",
+            value=password,
+            selectors=["input[type='password']"],
+            prefer_prompt=False,
+        )
+
         await smart_click(
             page,
             prompt=None,
-            selectors=["button:has-text('Continue')", "button:has-text('Next')"],
-            text_candidates=["Continue", "Next"],
+            selectors=[
+                "button:has-text('Sign in')",
+                "button:has-text('Log in')",
+                "button:has-text('Login')",
+                "input[type='submit']",
+            ],
+            text_candidates=["Sign in", "Log in", "Login", "Continue", "Next"],
             prefer_prompt=False,
         )
-        await _wait_brief(page, 650)
 
-    await _fill_all_matching(page, "input[type='password']", password)
-    await smart_fill(
-        page,
-        prompt="",
-        value=password,
-        selectors=["input[type='password']"],
-        prefer_prompt=False,
-    )
-
-    await smart_click(
-        page,
-        prompt=None,
-        selectors=[
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Sign in')",
-            "button:has-text('Log in')",
-            "button:has-text('Login')",
-        ],
-        text_candidates=["Sign in", "Log in", "Login", "Continue", "Next"],
-        prefer_prompt=False,
-    )
     await _wait_brief(page, 1100)
     state = await detect_auth_wall(page)
     return not state.detected
@@ -828,85 +886,131 @@ async def _switch_to_signup_if_possible(page: Any) -> bool:
     )
 
 
-async def _attempt_signup(page: Any, *, standard_fields: dict[str, str], email: str, password: str) -> bool:
-    # Try to switch to sign-up mode if we're on a login form.
-    await _switch_to_signup_if_possible(page)
-    await _wait_brief(page, 600)
-
-    # Fill common identity fields (best-effort).
-    first_name = str(standard_fields.get("first_name") or "").strip()
-    last_name = str(standard_fields.get("last_name") or "").strip()
-    full_name = str(standard_fields.get("full_name") or "").strip()
-    if first_name:
-        await smart_fill(
-            page,
-            prompt="",
-            value=first_name,
-            selectors=["input[name*='first' i]", "input[id*='first' i]"],
-            prefer_prompt=False,
-        )
-    if last_name:
-        await smart_fill(
-            page,
-            prompt="",
-            value=last_name,
-            selectors=["input[name*='last' i]", "input[id*='last' i]"],
-            prefer_prompt=False,
-        )
-    if full_name:
-        await smart_fill(
-            page,
-            prompt="",
-            value=full_name,
-            selectors=["input[name*='full' i]", "input[id*='full' i]", "input[name='name']"],
-            prefer_prompt=False,
-        )
-
-    await _fill_all_matching(
-        page,
-        "input[type='email'], input[name*='email' i], input[id*='email' i]",
-        email,
-    )
-    await smart_fill(
-        page,
-        prompt="",
-        value=email,
-        selectors=["input[type='email']", "input[name*='email' i]", "input[id*='email' i]"],
-        prefer_prompt=False,
-    )
-
-    await _fill_all_matching(page, "input[type='password']", password)
-    await smart_fill(
-        page,
-        prompt="",
-        value=password,
-        selectors=["input[type='password']"],
-        prefer_prompt=False,
-    )
-    await smart_fill(
-        page,
-        prompt="",
-        value=password,
-        selectors=["input[type='password']"],
-        prefer_prompt=False,
-    )
-
-    await _click_terms_checkboxes(page)
-
-    await smart_click(
+async def _switch_to_login_if_possible(page: Any) -> bool:
+    """Switch from a signup page to the login/sign-in view."""
+    return await smart_click(
         page,
         prompt=None,
         selectors=[
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Create account')",
-            "button:has-text('Sign up')",
-            "button:has-text('Register')",
-            "button:has-text('Continue')",
+            "a:has-text('Sign in')",
+            "a:has-text('Log in')",
+            "a:has-text('Login')",
+            "button:has-text('Sign in')",
+            "button:has-text('Log in')",
         ],
-        text_candidates=["Create account", "Sign up", "Register", "Continue", "Next"],
+        text_candidates=["Sign in", "Log in", "Login", "Already have an account"],
         prefer_prompt=False,
     )
+
+
+async def _attempt_signup(page: Any, *, standard_fields: dict[str, str], email: str, password: str) -> bool:
+    """
+    Fast, direct account creation.
+
+    Strategy:
+    1.  Try Workday data-automation-id selectors first (instant, exact).
+    2.  Fall back to generic selectors for non-Workday sites.
+    """
+    # ---- Workday fast-path (data-automation-id selectors) ----
+    workday = await page.locator('[data-automation-id="email"]').count() > 0
+
+    if workday:
+        logger.info("Signup: detected Workday layout, using data-automation-id selectors")
+        # Email
+        email_field = page.locator('[data-automation-id="email"]')
+        await email_field.click(timeout=2000)
+        await email_field.fill(email, timeout=2000)
+
+        # Password (type char-by-char so React validates each keystroke)
+        pw_field = page.locator('[data-automation-id="password"]')
+        await pw_field.click(timeout=2000)
+        await pw_field.fill("", timeout=1000)
+        await pw_field.type(password, delay=30, timeout=10000)
+
+        # Verify password
+        vpw_field = page.locator('[data-automation-id="verifyPassword"]')
+        await vpw_field.click(timeout=2000)
+        await vpw_field.fill("", timeout=1000)
+        await vpw_field.type(password, delay=30, timeout=10000)
+
+        # Consent checkbox
+        cb = page.locator('[data-automation-id="createAccountCheckbox"]')
+        if await cb.count() > 0:
+            checked = await cb.is_checked()
+            if not checked:
+                await cb.click(timeout=2000)
+
+        # Submit — force=True bypasses Workday's click_filter overlay interception
+        await page.locator('[data-automation-id="createAccountSubmitButton"]').click(force=True, timeout=3000)
+
+    else:
+        # ---- Generic path for non-Workday sites ----
+        logger.info("Signup: using generic selectors")
+        await _switch_to_signup_if_possible(page)
+        await _wait_brief(page, 600)
+
+        # Name fields (best-effort, skip if not present)
+        first_name = str(standard_fields.get("first_name") or "").strip()
+        last_name = str(standard_fields.get("last_name") or "").strip()
+        for sel, val in [
+            ("input[name*='first' i], input[id*='first' i]", first_name),
+            ("input[name*='last' i], input[id*='last' i]", last_name),
+        ]:
+            if val:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0:
+                        await loc.fill(val, timeout=2000)
+                except Exception:
+                    pass
+
+        # Email
+        await _fill_all_matching(
+            page,
+            "input[type='email'], input[name*='email' i], input[id*='email' i], input[autocomplete='email']",
+            email,
+        )
+
+        # Passwords (fill all visible ones)
+        pw_locs = page.locator("input[type='password']:visible")
+        pw_count = await pw_locs.count()
+        for i in range(pw_count):
+            field = pw_locs.nth(i)
+            try:
+                await field.click(timeout=2000)
+                await field.fill("", timeout=1000)
+                await field.type(password, delay=30, timeout=10000)
+            except Exception:
+                pass
+
+        # Terms / consent checkboxes
+        await _click_terms_checkboxes(page)
+
+        # Submit (avoid generic button[type='submit'] which matches nav buttons)
+        submitted = False
+        for sel in [
+            "button:has-text('Create Account')",
+            "button:has-text('Sign up')",
+            "button:has-text('Register')",
+            "input[type='submit']",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() > 0:
+                    await btn.click(timeout=3000)
+                    submitted = True
+                    break
+            except Exception:
+                continue
+        if not submitted:
+            return False
+
+    # ---- Wait for server response ----
+    await _wait_brief(page, 2500)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except Exception:
+        pass
     await _wait_brief(page, 1500)
     state = await detect_auth_wall(page)
     return not state.detected or state.kind in {"email_verification", "two_factor"}
@@ -1022,6 +1126,25 @@ async def maybe_auto_authenticate(
     creds = _get_credentials_for_host(host)
     if creds and creds.get("password"):
         performed = True
+
+        # If we're on a signup page but have creds, switch to the login view first.
+        if detection.kind == "signup":
+            logger.info("Have saved creds but on signup page — switching to sign-in view first")
+            is_wd = "workday" in host or "myworkdayjobs" in host
+            switched = False
+            if is_wd:
+                sign_in_link = page.locator('[data-automation-id="signInLink"]')
+                if await sign_in_link.count() > 0:
+                    await sign_in_link.first.click(force=True, timeout=3000)
+                    await _wait_brief(page, 1000)
+                    switched = True
+            if not switched:
+                switched = await _switch_to_login_if_possible(page)
+                if switched:
+                    await _wait_brief(page, 650)
+            if not switched:
+                logger.warning("Could not switch to login view; will try login on current page")
+
         ok = await _attempt_login(page, email=creds.get("email") or email, password=creds["password"])
         if ok:
             return {"ok": True, "performed": True, "kind": "", "host": host}
@@ -1078,14 +1201,112 @@ async def maybe_auto_authenticate(
         }
 
     performed = True
-    policy_text = await _extract_password_rule_text(page)
-    policy = _infer_password_policy(policy_text)
-    password = _generate_password(policy)
 
-    ok = await _attempt_signup(page, standard_fields=standard_fields, email=email, password=password)
+    # --- Try each universal password, fall back to dynamic generation ---
+    password: str | None = None
+    ok = False
+    for _idx in range(len(_UNIVERSAL_PASSWORDS)):
+        candidate = _next_universal_password()
+        logger.info("Signup attempt %d/%d with universal password", _idx + 1, len(_UNIVERSAL_PASSWORDS))
+        ok = await _attempt_signup(page, standard_fields=standard_fields, email=email, password=candidate)
+        if ok:
+            password = candidate
+            break
+        # Still on signup? Might be a validation error — try next password.
+        after = await detect_auth_wall(page, job_url=job_url)
+        if not after.detected or after.kind != "signup":
+            password = candidate
+            ok = True
+            break
+        logger.debug("Universal password %d rejected, trying next", _idx + 1)
+
+    if not ok:
+        # Last resort: dynamic password from site-specific rules.
+        logger.info("All universal passwords failed; falling back to dynamic generation")
+        policy_text = await _extract_password_rule_text(page)
+        policy = _infer_password_policy(policy_text)
+        password = _generate_password(policy)
+        ok = await _attempt_signup(page, standard_fields=standard_fields, email=email, password=password)
+
     if ok:
         # Persist once signup appears to have succeeded (or advanced into verification/2FA).
         _upsert_credentials(host, email=email, password=password)
+
+        # Workday post-signup: three possible outcomes —
+        #   1) Direct to app (no auth wall)
+        #   2) Sign-in page (just login, no verification needed)
+        #   3) Verification required (check Gmail, then login)
+        is_workday = "workday" in host or "myworkdayjobs" in host
+        if is_workday:
+            import asyncio
+            logger.info("Workday signup succeeded — checking post-signup state...")
+            await _wait_brief(page, 2000)
+
+            after = await detect_auth_wall(page, job_url=job_url)
+
+            # Case 1: Already in the app (no auth wall).
+            if not after.detected:
+                logger.info("Workday: no auth wall after signup — already in the app")
+                return {"ok": True, "performed": True, "kind": "", "host": host}
+
+            # Case 2: Sign-in page — try logging in directly first.
+            if after.kind in {"login", "signup"}:
+                logger.info("Workday: sign-in page after signup — attempting login...")
+                login_ok = await _attempt_login(page, email=email, password=password)
+                if login_ok:
+                    return {"ok": True, "performed": True, "kind": "", "host": host}
+                logger.info("Workday: direct login failed — may need email verification")
+
+            # Case 3: Check Gmail for verification email (~6s window).
+            alternate_email = str(standard_fields.get("alternate_email") or "").strip()
+            await _wait_brief(page, 3000)  # give Workday time to send the email
+            verified = False
+            try:
+                verified = await _attempt_email_verification_via_gmail(
+                    page, host=host, primary_email=email, alternate_email=alternate_email,
+                )
+            except Exception:
+                verified = False
+
+            if verified:
+                logger.info("Workday email verification succeeded — attempting login...")
+                await _wait_brief(page, 2000)
+                after = await detect_auth_wall(page, job_url=job_url)
+                if not after.detected:
+                    return {"ok": True, "performed": True, "kind": "", "host": host}
+                if after.kind in {"login", "signup"}:
+                    login_ok = await _attempt_login(page, email=email, password=password)
+                    if login_ok:
+                        return {"ok": True, "performed": True, "kind": "", "host": host}
+
+            # If nothing worked automatically, pause for human.
+            if human_in_loop and pause_on_auth and sys.stdin.isatty():
+                shot = await capture_step(page, output_dir, f"{stage}-verify-email", screenshots)
+                print(
+                    f"\nWorkday account created. If email verification is needed,\n"
+                    f"check {email}, click the link, then sign in.\n"
+                    f"Press Enter when done.\n",
+                    file=sys.stderr,
+                )
+                user_input = (await human_pause("Continue after auth> ")).strip().lower()
+                if user_input == "abort":
+                    return {
+                        "ok": False, "performed": True, "kind": "email_verification",
+                        "host": host, "reason": "User aborted during authentication",
+                    }
+                deadline = asyncio.get_event_loop().time() + float(max_wait_sec)
+                while asyncio.get_event_loop().time() < deadline:
+                    await _wait_brief(page, 900)
+                    now = await detect_auth_wall(page, job_url=job_url)
+                    if not now.detected:
+                        return {"ok": True, "performed": True, "kind": "", "host": host}
+                return {"ok": True, "performed": True, "kind": "", "host": host}
+
+            return {
+                "ok": False, "performed": True, "kind": "email_verification",
+                "host": host, "reason": "Workday account created but could not complete authentication",
+            }
+
         after = await detect_auth_wall(page, job_url=job_url)
         if after.detected and after.kind in manual_kinds:
             return await maybe_auto_authenticate(

@@ -376,6 +376,7 @@ async def run_single_application(
         leave_open = bool(
             keep_open
             or handoff_active
+            or (human_in_loop and dry_run)
             or (timed_out and human_in_loop and sys.stdin.isatty())
         )
 

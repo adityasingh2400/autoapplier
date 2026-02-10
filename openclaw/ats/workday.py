@@ -4,27 +4,12 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import BaseATSHandler
 from openclaw.utils import smart_click, maybe_await
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Workday page-heading → handler mapping
-# ---------------------------------------------------------------------------
-# Workday multi-page applications have a progress bar whose heading
-# identifies each step (e.g. "My Information", "My Experience", …).
-# We detect the heading text and dispatch to page-specific pre-fill hooks.
-WORKDAY_PAGE_HEADINGS: dict[str, str] = {
-    "my information": "page1",
-    "my experience": "page2",
-    "application questions": "page3",
-    "voluntary disclosures": "page4",
-    "self identify": "page5",
-    "review": "page6",
-}
 
 
 @dataclass(slots=True)
@@ -96,12 +81,116 @@ class WorkdayHandler(BaseATSHandler):
         }
     )
 
+    # Extend the base protocol table for Workday-specific control types.
+    # New protocols can be added here as they're discovered.
+    _FILL_PROTOCOLS: ClassVar[dict[str, str]] = {
+        **BaseATSHandler._FILL_PROTOCOLS,
+        # Future Workday-specific protocols go here, e.g.:
+        # "workday_date_spinbutton": "_proto_workday_date_spinbutton",
+    }
+
     async def apply(self, page: Any, ctx: Any) -> dict:
         """Override to bump max_form_pages for Workday's 6-step flow."""
         if hasattr(ctx, "max_form_pages") and ctx.max_form_pages < 6:
             ctx.max_form_pages = 6
             logger.debug("[Workday] Bumped max_form_pages to 6")
         return await super(WorkdayHandler, self).apply(page, ctx)
+
+    # ------------------------------------------------------------------
+    # Unified "page ready" gate — call before ANY form interaction
+    # ------------------------------------------------------------------
+    async def _wait_for_page_ready(self, page: Any, *, timeout_sec: float = 10.0) -> bool:
+        """
+        Poll until the Workday page is stable and ready for interaction.
+
+        Checks:
+          1. No loading spinners / overlays visible
+          2. At least 3 form controls visible (rules out just the language selector)
+          3. DOM has stopped changing (two consecutive snapshots match)
+
+        Returns True if the page is ready, False if we timed out.
+        """
+        import time
+        deadline = time.monotonic() + timeout_sec
+        locator_fn = getattr(page, "locator", None)
+        evaluate_fn = getattr(page, "evaluate", None)
+        if not locator_fn or not evaluate_fn:
+            await asyncio.sleep(3.0)  # blind fallback
+            return True
+
+        MIN_CONTROLS = 3  # A real Workday form page has many more than 1-2 controls
+        prev_control_count = -1
+        stable_ticks = 0  # how many consecutive polls showed the same control count
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+
+            # Check 1: loading spinners gone?
+            try:
+                loading = await maybe_await(evaluate_fn("""
+                    () => {
+                        const spinners = document.querySelectorAll(
+                            '[data-automation-id="wd-Loading"], ' +
+                            '[data-automation-id="LoadingPanel"], ' +
+                            '.wd-LoadingPanel, ' +
+                            '[role="progressbar"], ' +
+                            '[aria-busy="true"]'
+                        );
+                        for (const s of spinners) {
+                            const rect = s.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) return true;
+                        }
+                        return false;
+                    }
+                """))
+                if loading:
+                    stable_ticks = 0
+                    prev_control_count = -1
+                    continue
+            except Exception:
+                pass
+
+            # Check 2: count visible form controls
+            try:
+                control_count = await maybe_await(evaluate_fn("""
+                    () => {
+                        const els = document.querySelectorAll(
+                            'input:not([type="hidden"]), select, textarea, ' +
+                            '[role="combobox"], [role="radio"], [role="checkbox"]'
+                        );
+                        let n = 0;
+                        for (const el of els) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width >= 2 && rect.height >= 2) n++;
+                        }
+                        return n;
+                    }
+                """))
+                control_count = int(control_count or 0)
+            except Exception:
+                control_count = 0
+
+            # Not enough controls yet — page is still loading
+            if control_count < MIN_CONTROLS:
+                stable_ticks = 0
+                prev_control_count = control_count
+                continue
+
+            # Check 3: DOM stability — same control count for 2 consecutive polls
+            if control_count == prev_control_count:
+                stable_ticks += 1
+            else:
+                stable_ticks = 0
+            prev_control_count = control_count
+
+            if stable_ticks >= 2:
+                elapsed = timeout_sec - (deadline - time.monotonic())
+                logger.debug("[Workday] Page ready: %d controls visible (%.1fs)", control_count, elapsed)
+                return True
+
+        elapsed = timeout_sec - (deadline - time.monotonic())
+        logger.warning("[Workday] Page ready timeout after %.1fs (%d controls)", timeout_sec, prev_control_count)
+        return False
 
     async def _open_apply_form(self, page: Any) -> None:
         await super(WorkdayHandler, self)._open_apply_form(page)
@@ -143,277 +232,443 @@ class WorkdayHandler(BaseATSHandler):
             if not clicked:
                 break
 
-    async def _fill_workday_directory_picker(
-        self, page: Any, *, target_category: str = "Job Board",
-        sub_option: str | None = None,
-    ) -> bool:
-        """
-        Handle Workday's 'How Did You Hear About Us?' multi-select directory picker.
-
-        Reverse-engineered from live Workday DOM observation:
-        1. Click the promptIcon SPAN inside [data-automation-id="formField-source"]
-           → A listbox "Options Expanded" appears with category options
-             (Agency, Job Board, etc.) — NO radio buttons.
-        2. Click the option matching target_category (e.g. "Job Board")
-           → That listbox replaces itself with a sub-options listbox
-             that HAS radio buttons (Bizjetjobs, Indeed, etc.)
-        3. Click the desired sub-option
-           → Auto-selects, popup closes. No OK button needed.
-           → Field shows "1 item selected, Indeed"
-        """
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-
-        # ── Step 1: Click the promptIcon inside formField-source ──
-        icon = locator_fn(
-            "[data-automation-id='formField-source'] [data-automation-id='promptIcon']"
-        ).first
-        try:
-            if not await maybe_await(icon.is_visible()):
-                logger.debug("Workday picker: promptIcon not visible")
-                return False
-            await maybe_await(icon.click(timeout=3000))
-            logger.debug("Workday picker: Step 1 — clicked promptIcon")
-        except Exception as e:
-            logger.debug("Workday picker: Step 1 failed: %s", e)
-            return False
-
-        await asyncio.sleep(1.0)
-
-        # ── Step 2: Click the category option (e.g. "Job Board") ──
-        # The listbox that appears has options WITHOUT radio buttons.
-        try:
-            cat_option = locator_fn(
-                f"[role='option']:has-text('{target_category}')"
-            ).first
-            await maybe_await(cat_option.click(timeout=3000))
-            logger.debug("Workday picker: Step 2 — clicked category '%s'", target_category)
-        except Exception as e:
-            logger.debug("Workday picker: Step 2 failed: %s", e)
-            keyboard = getattr(page, "keyboard", None)
-            if keyboard:
-                try:
-                    await maybe_await(keyboard.press("Escape"))
-                except Exception:
-                    pass
-            return False
-
-        await asyncio.sleep(1.0)
-
-        # ── Step 3: Click a sub-option from the new listbox (has radio buttons) ──
-        # Try the preferred sub_option first, then fallback to first visible option.
-        preferred = sub_option or "Indeed"
-        selected_text = None
-
-        for attempt in range(3):
-            try:
-                # Try preferred option first
-                pref_option = locator_fn(
-                    f"[role='option']:has-text('{preferred}')"
-                ).first
-                if await maybe_await(pref_option.is_visible()):
-                    await maybe_await(pref_option.click(timeout=3000))
-                    selected_text = preferred
-                    break
-            except Exception:
-                pass
-
-            # Fallback: click the first visible option that has a radio button
-            try:
-                all_options = locator_fn("[role='option']")
-                count = await maybe_await(all_options.count())
-                for idx in range(count):
-                    opt = all_options.nth(idx)
-                    try:
-                        if not await maybe_await(opt.is_visible()):
-                            continue
-                        # Check if this option contains a radio (sub-option, not category)
-                        radio = opt.locator("[role='radio']")
-                        radio_count = await maybe_await(radio.count())
-                        if radio_count == 0:
-                            continue
-                        opt_text = (await maybe_await(opt.text_content()) or "").strip()
-                        await maybe_await(opt.click(timeout=3000))
-                        selected_text = opt_text
-                        break
-                    except Exception:
-                        continue
-                if selected_text:
-                    break
-            except Exception:
-                pass
-
-            await asyncio.sleep(0.8)
-
-        if not selected_text:
-            logger.debug("Workday picker: Step 3 — couldn't select a sub-option")
-            keyboard = getattr(page, "keyboard", None)
-            if keyboard:
-                try:
-                    await maybe_await(keyboard.press("Escape"))
-                except Exception:
-                    pass
-            return False
-
-        logger.info("Workday directory picker: selected '%s' under '%s'",
-                    selected_text[:50], target_category)
-        return True
-
-    # ------------------------------------------------------------------
-    # Page detection
-    # ------------------------------------------------------------------
-    async def _detect_workday_page(self, page: Any) -> str:
-        """Return a page key like 'page1', 'page2', … based on the active step heading."""
+    async def _page2_controls_present(self, page: Any) -> bool:
+        """True if page 2 elements (Work Experience, Education, Skills, Websites) are visible."""
         evaluate_fn = getattr(page, "evaluate", None)
         if not evaluate_fn:
-            return "unknown"
+            return False
         try:
-            heading_text: str = await maybe_await(evaluate_fn("""
+            ok: bool = await maybe_await(evaluate_fn("""
                 () => {
-                    // Strategy 1: Workday marks the current step with aria-current="step"
-                    // or aria-current="true" in the progress bar
-                    const currentStep = document.querySelector(
-                        '[aria-current="step"], [aria-current="true"], ' +
-                        '[data-automation-id="progressBar"] [aria-selected="true"], ' +
-                        '.css-1xkhfkz [aria-current]'
+                    const el = document.querySelector(
+                        '[data-automation-id*="workExperience"], ' +
+                        '[data-automation-id*="education"], ' +
+                        '#Websites-section, [aria-labelledby="Websites-section"], ' +
+                        '[data-automation-id*="skills"]'
                     );
-                    if (currentStep) {
-                        const text = (currentStep.textContent || '').trim();
-                        if (text) return text;
-                    }
-
-                    // Strategy 2: Look for the active step by class (bold/highlighted)
-                    const steps = document.querySelectorAll('[data-automation-id="progressBar"] li, [data-automation-id="progressBar"] div[role="listitem"]');
-                    for (const step of steps) {
-                        const style = window.getComputedStyle(step);
-                        // Active steps typically have bold font or different color
-                        if (style.fontWeight >= 700 || step.classList.contains('css-1wc5nlo')) {
-                            const text = (step.textContent || '').trim();
-                            if (text) return text;
-                        }
-                    }
-
-                    // Strategy 3: Find the first heading that's NOT in the progress bar
-                    // (the page content heading)
-                    const progressBar = document.querySelector('[data-automation-id="progressBar"]');
-                    const allH2 = document.querySelectorAll('h2');
-                    for (const h2 of allH2) {
-                        if (progressBar && progressBar.contains(h2)) continue;
-                        if (h2.offsetParent !== null) {
-                            const text = (h2.textContent || '').trim();
-                            if (text) return text;
-                        }
-                    }
-
-                    // Strategy 4: Last resort — try data-automation-id for section identifiers
-                    const formContent = document.querySelector('[data-automation-id="formContent"]');
-                    if (formContent) {
-                        const firstH2 = formContent.querySelector('h2');
-                        if (firstH2) return (firstH2.textContent || '').trim();
-                    }
-
-                    return '';
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width >= 2 && rect.height >= 2;
                 }
             """))
-            heading_lower = heading_text.lower().strip()
-            for key, page_id in WORKDAY_PAGE_HEADINGS.items():
-                if key in heading_lower:
-                    logger.debug("[Workday] Detected page heading '%s' → %s", heading_text, page_id)
-                    return page_id
-        except Exception as exc:
-            logger.debug("[Workday] Page detection failed: %s", exc)
-
-        # Content-based fallback: detect by page-specific elements
-        try:
-            page_type: str = await maybe_await(evaluate_fn("""
-                () => {
-                    // Check for Work Experience section (page 2)
-                    if (document.querySelector('[data-automation-id*="workExperience"], [data-automation-id*="education"]'))
-                        return 'page2';
-                    // Check for My Information fields (page 1)
-                    if (document.querySelector('#emailAddress--emailAddress, #address--addressLine1, [data-automation-id*="legalName"]'))
-                        return 'page1';
-                    // Check for Application Questions (page 3+)
-                    if (document.querySelector('[data-automation-id*="questionnaire"], [data-automation-id*="primaryQuestionnaire"]'))
-                        return 'page3';
-                    // Check for Review/Summary page
-                    if (document.querySelector('[data-automation-id*="review"], [data-automation-id*="summary"]'))
-                        return 'review';
-                    return '';
-                }
-            """))
-            if page_type:
-                logger.debug("[Workday] Detected page by content: %s", page_type)
-                return page_type
+            return bool(ok)
         except Exception:
-            pass
-        return "unknown"
+            return False
 
     # ------------------------------------------------------------------
-    # Pre-fill dispatcher
+    # Pre-fill dispatcher (content-based, no heading polling)
     # ------------------------------------------------------------------
     async def _pre_fill_special_controls(self, page: Any, ctx: Any) -> None:
-        """Handle Workday-specific widgets before standard form filling."""
+        """Handle Workday-specific widgets before snapshot-fill runs."""
         locator_fn = getattr(page, "locator", None)
         if not locator_fn:
             return
 
-        # Wait for Workday SPA page transition to settle.
-        # After clicking "Next", the DOM heading may take 1-3s to update.
-        # We poll until the heading changes from the previous page's heading.
-        prev_page = self._last_detected_page
-        current_page = "unknown"
-        # First poll after 2s (give SPA time to render), then 0.5s intervals
-        await asyncio.sleep(2.0)
-        current_page = await self._detect_workday_page(page)
-        if current_page == "unknown" or (prev_page is not None and current_page == prev_page):
-            # Heading hasn't changed yet — poll more aggressively
-            for _poll in range(6):  # up to 3s more (6 × 0.5s)
-                await asyncio.sleep(0.5)
-                current_page = await self._detect_workday_page(page)
-                if current_page != "unknown" and (prev_page is None or current_page != prev_page):
-                    break
-        self._last_detected_page = current_page
-        logger.info("[Workday] Current page: %s", current_page)
+        # 1. Wait for the page to be fully loaded and stable.
+        await self._wait_for_page_ready(page)
 
-        # Track which pages we've already pre-filled to avoid duplicate work.
-        # _pages_filled is a set[str] field on BaseATSHandler.
-        if current_page == "page1" and "page1" not in self._pages_filled:
-            self._pages_filled.add("page1")
-            await self._pre_fill_page1(page, ctx)
-        elif current_page == "page2" and "page2" not in self._pages_filled:
-            self._pages_filled.add("page2")
-            await self._pre_fill_page2_my_experience(page, ctx)
-        elif current_page not in self._pages_filled:
-            if current_page != "unknown":
-                self._pages_filled.add(current_page)
-            # For pages other than page1/page2, no special pre-fill needed
-            # (application questions, review, etc. are handled by snapshot-and-fill)
-
-    async def _pre_fill_page1(self, page: Any, ctx: Any) -> None:
-        """Page 1 ('My Information'): How Did You Hear directory picker."""
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return
-        try:
-            heard_label = locator_fn("text=/How Did You Hear/i").first
-            # Wait for the label to appear (may still be loading after page transition)
+        # 2. "How Did You Hear About Us?" — do this first since it clicks around.
+        if "how_did_you_hear" not in self._pages_filled:
             try:
-                await maybe_await(heard_label.wait_for(state="visible", timeout=5000))
+                source_field = locator_fn("[data-automation-id='formField-source']").first
+                if await maybe_await(source_field.is_visible(timeout=1500)):
+                    self._pages_filled.add("how_did_you_hear")
+                    await self._fill_how_did_you_hear(page)
             except Exception:
-                logger.debug("[Workday] 'How Did You Hear' label not found after 5s wait.")
-                return
-            logger.info("[Workday] Attempting 'How Did You Hear' directory picker...")
-            ok = await self._fill_workday_directory_picker(page, target_category="Job Board")
-            if ok:
-                logger.info("[Workday] 'How Did You Hear' filled via directory picker.")
-            else:
-                logger.debug("[Workday] 'How Did You Hear' directory picker failed.")
+                pass
+
+        # 3. "Previously Worked" → No (every page, short-circuits if not visible).
+        await self._click_previously_worked_no(page)
+
+        # 4. Page 2 structured data (work experience, education, skills, etc.)
+        if "page2" not in self._pages_filled and await self._page2_controls_present(page):
+            self._pages_filled.add("page2")
+            logger.info("[Workday] Filling page 2 (My Experience) controls...")
+            await self._pre_fill_page2_my_experience(page, ctx)
+
+    async def _click_previously_worked_no(self, page: Any) -> bool:
+        """
+        Explicitly click the "No" radio for any "Have you previously worked for [company]?"
+        question. The answer is ALWAYS "No" across all job boards.
+        """
+        evaluate_fn = getattr(page, "evaluate", None)
+        if not evaluate_fn:
+            return False
+
+        # Strategy 0 (fastest): Click the <label> for the "No" radio inside the correct container.
+        # Clicking the label triggers native form association (for="...") which fires React events.
+        # force=True on the hidden <input> does NOT work — React's synthetic events don't fire.
+        try:
+            container = page.locator('[data-automation-id="formField-candidateIsPreviousWorker"]')
+            if await maybe_await(container.count()) > 0:
+                no_label = container.locator('label:has-text("No")').first
+                if await maybe_await(no_label.is_visible(timeout=1500)):
+                    await maybe_await(no_label.click(timeout=2000))
+                    await asyncio.sleep(0.3)
+                    logger.info("[Workday] Clicked 'No' for 'previously worked' (via label click)")
+                    return True
         except Exception:
             pass
 
+        # Strategy 1: Use Playwright get_by_role for ARIA radiogroups
+        try:
+            rg = page.get_by_role("radiogroup", name=re.compile(r"previously\s+worked", re.I)).first
+            if await maybe_await(rg.is_visible(timeout=1500)):
+                no_radio = rg.get_by_role("radio", name=re.compile(r"^no\s*$", re.I)).first
+                if await maybe_await(no_radio.is_visible(timeout=1000)):
+                    handle = await maybe_await(no_radio.element_handle(timeout=1500))
+                    if handle:
+                        # Click the label instead of the radio input for React compatibility
+                        await maybe_await(page.evaluate(
+                            """(el) => {
+                                // If this is a native input, click its label instead
+                                if (el.tagName === 'INPUT' && el.type === 'radio') {
+                                    let label = null;
+                                    if (el.id) {
+                                        label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                                    }
+                                    if (!label) {
+                                        label = el.closest('label');
+                                    }
+                                    if (label) {
+                                        label.scrollIntoView({block: 'center'});
+                                        label.click();
+                                        return;
+                                    }
+                                }
+                                // Fallback for ARIA radios or if no label found
+                                el.scrollIntoView({block: 'center'});
+                                el.click();
+                            }""",
+                            handle,
+                        ))
+                        await asyncio.sleep(0.3)
+                        logger.info("[Workday] Clicked 'No' for 'previously worked' (via ARIA radiogroup)")
+                        return True
+        except Exception:
+            pass
+
+        # Strategy 2: JS-based — find native radio inputs near "previously worked" text
+        # Works when there's no role="radiogroup" wrapper (common in Workday)
+        try:
+            clicked: bool = await maybe_await(evaluate_fn("""
+                () => {
+                    // Find any label/legend/text that mentions "previously worked"
+                    const allText = document.body.querySelectorAll('label, legend, p, span, div');
+                    let container = null;
+                    for (const el of allText) {
+                        const t = (el.innerText || '').toLowerCase();
+                        if (t.includes('previously worked') && t.length < 500) {
+                            container = el.closest('fieldset, [role="group"], [role="radiogroup"], div');
+                            if (container) break;
+                        }
+                    }
+                    if (!container) return false;
+
+                    // Find all radio inputs in/near this container
+                    const radios = container.querySelectorAll('input[type="radio"]');
+                    if (!radios.length) {
+                        // Also check for ARIA radios
+                        const ariaRadios = container.querySelectorAll('[role="radio"]');
+                        for (const r of ariaRadios) {
+                            const label = (r.getAttribute('aria-label') || r.innerText || '').trim().toLowerCase();
+                            if (label === 'no') {
+                                r.scrollIntoView({block: 'center'});
+                                r.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
+                    // For native radios: find the one labeled "No"
+                    for (const r of radios) {
+                        // Check the label associated with this radio
+                        let lbl = '';
+                        if (r.id) {
+                            const labelEl = document.querySelector('label[for="' + CSS.escape(r.id) + '"]');
+                            if (labelEl) lbl = (labelEl.innerText || '').trim().toLowerCase();
+                        }
+                        if (!lbl) {
+                            const wrap = r.closest('label');
+                            if (wrap) lbl = (wrap.innerText || '').trim().toLowerCase();
+                        }
+                        if (!lbl) {
+                            // Check next sibling text
+                            const next = r.nextElementSibling || r.parentElement;
+                            if (next) lbl = (next.innerText || '').trim().toLowerCase();
+                        }
+                        if (lbl === 'no' || r.value.toLowerCase() === 'no') {
+                            // Click the label instead of the radio input for React compatibility
+                            let clickTarget = null;
+                            if (r.id) {
+                                clickTarget = document.querySelector('label[for="' + CSS.escape(r.id) + '"]');
+                            }
+                            if (!clickTarget) {
+                                clickTarget = r.closest('label');
+                            }
+                            if (clickTarget) {
+                                clickTarget.scrollIntoView({block: 'center'});
+                                clickTarget.click();
+                            } else {
+                                // Fallback to clicking the radio directly if no label found
+                                r.scrollIntoView({block: 'center'});
+                                r.click();
+                            }
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """))
+            if clicked:
+                await asyncio.sleep(0.3)
+                logger.info("[Workday] Clicked 'No' for 'previously worked' (via JS fallback)")
+                return True
+        except Exception as exc:
+            logger.debug("[Workday] 'previously worked' JS fallback failed: %s", exc)
+
+        return False
+
     # ------------------------------------------------------------------
+    # "How Did You Hear" — simple inline handler (no pre-fill)
+    # ------------------------------------------------------------------
+    async def _dump_dom_around_source(self, page: Any, step_label: str) -> None:
+        """Dump detailed DOM info around the 'How Did You Hear' field for debugging."""
+        evaluate_fn = getattr(page, "evaluate", None)
+        if not evaluate_fn:
+            return
+        try:
+            dump = await maybe_await(evaluate_fn("""
+                (stepLabel) => {
+                    const out = { step: stepLabel };
+
+                    // 1. The formField-source container
+                    const src = document.querySelector('[data-automation-id="formField-source"]');
+                    out.sourceExists = !!src;
+                    if (src) {
+                        out.sourceHTML = src.outerHTML.slice(0, 2000);
+                        out.sourceChildren = Array.from(src.querySelectorAll('*')).slice(0, 50).map(el => ({
+                            tag: el.tagName,
+                            id: el.id || '',
+                            aid: el.getAttribute('data-automation-id') || '',
+                            role: el.getAttribute('role') || '',
+                            cls: (el.className || '').toString().slice(0, 80),
+                            text: (el.innerText || '').slice(0, 60),
+                            visible: el.getBoundingClientRect().width > 0
+                        }));
+                    }
+
+                    // 2. All menuItem elements on the page
+                    const menuItems = document.querySelectorAll('[data-automation-id="menuItem"]');
+                    out.menuItemCount = menuItems.length;
+                    out.menuItems = Array.from(menuItems).slice(0, 20).map(el => ({
+                        text: (el.innerText || '').slice(0, 80),
+                        visible: el.getBoundingClientRect().width > 0,
+                        parent: el.parentElement ? {
+                            tag: el.parentElement.tagName,
+                            id: el.parentElement.id || '',
+                            aid: el.parentElement.getAttribute('data-automation-id') || '',
+                            role: el.parentElement.getAttribute('role') || ''
+                        } : null
+                    }));
+
+                    // 3. Any popups/overlays/dialogs currently visible
+                    const popupSels = [
+                        '[data-automation-id*="popup"]',
+                        '[data-automation-id*="Popup"]',
+                        '[role="dialog"]',
+                        '[role="listbox"]',
+                        '[data-automation-id*="menuItemGroup"]',
+                        '[data-automation-id*="promptSearch"]'
+                    ];
+                    out.popups = [];
+                    for (const sel of popupSels) {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                out.popups.push({
+                                    selector: sel,
+                                    tag: el.tagName,
+                                    id: el.id || '',
+                                    aid: el.getAttribute('data-automation-id') || '',
+                                    role: el.getAttribute('role') || '',
+                                    childCount: el.children.length,
+                                    html: el.outerHTML.slice(0, 500)
+                                });
+                            }
+                        }
+                    }
+
+                    // 4. All elements with data-automation-id containing "source" or "prompt"
+                    const related = document.querySelectorAll(
+                        '[data-automation-id*="source"], [data-automation-id*="prompt"], [data-automation-id*="selectedItem"]'
+                    );
+                    out.relatedElements = Array.from(related).slice(0, 30).map(el => ({
+                        tag: el.tagName,
+                        aid: el.getAttribute('data-automation-id') || '',
+                        id: el.id || '',
+                        text: (el.innerText || '').slice(0, 60),
+                        visible: el.getBoundingClientRect().width > 0
+                    }));
+
+                    return JSON.stringify(out, null, 2);
+                }
+            """, step_label))
+            logger.info("[HowDidYouHear DOM @ %s]\n%s", step_label, dump)
+        except Exception as exc:
+            logger.debug("[HowDidYouHear DOM dump failed @ %s]: %s", step_label, exc)
+
+    async def _fill_how_did_you_hear(self, page: Any) -> bool:
+        """
+        Dead-simple handler for 'How Did You Hear About Us?'
+
+        The answer does not matter. Steps:
+        1. Click the prompt icon to open the dropdown
+        2. Click ANY visible promptOption (the actual dropdown items)
+        3. Click neutral whitespace to close
+
+        IMPORTANT: The dropdown options use data-automation-id="promptOption"
+        (and "promptLeafNode"), NOT "menuItem". "menuItem" belongs to the
+        phone-country-code multiselect and will click the wrong thing.
+        """
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn:
+            return False
+
+        logger.info("[HowDidYouHear] Starting")
+
+        # ── Step 1: Click the prompt icon to open the dropdown ──
+        try:
+            icon = locator_fn(
+                "[data-automation-id='formField-source'] [data-automation-id='promptIcon']"
+            ).first
+            visible = await maybe_await(icon.is_visible())
+            logger.info("[HowDidYouHear] Step 1: promptIcon visible=%s", visible)
+            if not visible:
+                logger.warning("[HowDidYouHear] promptIcon not visible — aborting")
+                return False
+            await maybe_await(icon.click(force=True, timeout=3000))
+            logger.info("[HowDidYouHear] Step 1: clicked promptIcon")
+        except Exception as e:
+            logger.error("[HowDidYouHear] Step 1 FAILED: %s", e)
+            return False
+
+        await asyncio.sleep(1.5)
+
+        # ── Step 2: Click ANY visible promptOption ──
+        # Use "div[...]" to exclude the phone-country-code's <P> tag which
+        # also has data-automation-id="promptOption" but is NOT a dropdown option.
+        # The real "How Did You Hear" options are always <DIV> tags.
+        try:
+            options = locator_fn("div[data-automation-id='promptOption']")
+            count = await maybe_await(options.count())
+            logger.info("[HowDidYouHear] Step 2: found %d div promptOption elements", count)
+
+            if count == 0:
+                logger.warning("[HowDidYouHear] Step 2: no promptOption found — aborting")
+                await maybe_await(page.mouse.click(10, 10))
+                return False
+
+            # Click the first visible one
+            clicked = False
+            for idx in range(min(count, 20)):
+                opt = options.nth(idx)
+                try:
+                    vis = await maybe_await(opt.is_visible())
+                    text = (await maybe_await(opt.text_content()) or "").strip()
+                    logger.info(
+                        "[HowDidYouHear] Step 2: promptOption[%d] visible=%s text='%s'",
+                        idx, vis, text[:60],
+                    )
+                    if vis:
+                        await maybe_await(opt.click(force=True, timeout=3000))
+                        logger.info(
+                            "[HowDidYouHear] Step 2: CLICKED promptOption[%d] '%s'",
+                            idx, text[:60],
+                        )
+                        clicked = True
+                        break
+                except Exception as e:
+                    logger.debug("[HowDidYouHear] Step 2: promptOption[%d] error: %s", idx, e)
+                    continue
+
+            if not clicked:
+                logger.warning("[HowDidYouHear] Step 2: could not click any promptOption")
+                await maybe_await(page.mouse.click(10, 10))
+                return False
+        except Exception as e:
+            logger.error("[HowDidYouHear] Step 2 FAILED: %s", e)
+            await maybe_await(page.mouse.click(10, 10))
+            return False
+
+        await asyncio.sleep(1.0)
+
+        # ── Step 3: Check if this was a category (has sub-options) or a leaf ──
+        # If new promptOptions appeared, click one of them too.
+        try:
+            options = locator_fn("div[data-automation-id='promptOption']")
+            count = await maybe_await(options.count())
+            logger.info("[HowDidYouHear] Step 3: %d div promptOption elements after click", count)
+
+            if count > 0:
+                # There are still options visible — could be sub-options.
+                # Check if the field already has a selection.
+                sel_label = locator_fn(
+                    "[data-automation-id='formField-source'] "
+                    "[data-automation-id='promptAriaInstruction']"
+                ).first
+                sel_text = (await maybe_await(sel_label.text_content()) or "").strip()
+                logger.info("[HowDidYouHear] Step 3: selection state = '%s'", sel_text)
+
+                # If still "0 items selected" or "Expanded", we need to click a sub-option
+                if "0 items" in sel_text.lower() or "expanded" in sel_text.lower():
+                    for idx in range(min(count, 20)):
+                        opt = options.nth(idx)
+                        try:
+                            vis = await maybe_await(opt.is_visible())
+                            text = (await maybe_await(opt.text_content()) or "").strip()
+                            if vis:
+                                await maybe_await(opt.click(force=True, timeout=3000))
+                                logger.info(
+                                    "[HowDidYouHear] Step 3: CLICKED sub-option[%d] '%s'",
+                                    idx, text[:60],
+                                )
+                                break
+                        except Exception:
+                            continue
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug("[HowDidYouHear] Step 3 error: %s", e)
+
+        # ── Step 4: Click neutral whitespace to close ──
+        try:
+            await maybe_await(page.mouse.click(10, 10))
+            logger.info("[HowDidYouHear] Step 4: clicked whitespace to close")
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.5)
+
+        # Verify selection
+        try:
+            sel_label = locator_fn(
+                "[data-automation-id='formField-source'] "
+                "[data-automation-id='promptAriaInstruction']"
+            ).first
+            sel_text = (await maybe_await(sel_label.text_content()) or "").strip()
+            if "0 items" in sel_text.lower():
+                logger.warning("[HowDidYouHear] FAILED — still 0 items selected")
+                return False
+            else:
+                logger.info("[HowDidYouHear] SUCCESS — selection: '%s'", sel_text)
+                return True
+        except Exception:
+            pass
+
+        logger.info("[HowDidYouHear] Done")
+        return True
     # Page 2: "My Experience"
     # ------------------------------------------------------------------
     async def _pre_fill_page2_my_experience(self, page: Any, ctx: Any) -> None:
@@ -430,12 +685,47 @@ class WorkdayHandler(BaseATSHandler):
 
         await self._fill_work_experience(page, resume_data)
         await self._fill_education(page, ctx, resume_data)
+
+        # Ensure any lingering dropdowns (Field of Study, Degree) are fully
+        # dismissed before opening the Skills multiselect picker.
+        # Workday's React can leave popups open despite Escape + whitespace clicks.
+        try:
+            keyboard = getattr(page, "keyboard", None)
+            mouse = getattr(page, "mouse", None)
+            if keyboard:
+                await maybe_await(keyboard.press("Escape"))
+                await asyncio.sleep(0.3)
+            if mouse:
+                await maybe_await(mouse.click(10, 10))
+                await asyncio.sleep(0.5)
+            # Verify no listbox is still open
+            listbox_open = await maybe_await(page.evaluate("""() => {
+                const lb = document.querySelector("[role='listbox']");
+                if (!lb) return false;
+                const r = lb.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }"""))
+            if listbox_open:
+                if keyboard:
+                    await maybe_await(keyboard.press("Escape"))
+                    await asyncio.sleep(0.3)
+                if mouse:
+                    await maybe_await(mouse.click(10, 10))
+                    await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
         await self._fill_skills(page, ctx, resume_data)
         await self._fill_websites(page, ctx, resume_data)
         await self._fill_social_urls(page, ctx, resume_data)
 
     def _get_snapshot_skip_labels(self) -> list[str]:
-        """Labels the snapshot-and-fill should skip on Workday (handled by pre-fill)."""
+        """Labels the snapshot-and-fill should skip on Workday (handled by pre-fill).
+
+        'how did you hear' is handled by _fill_how_did_you_hear in pre-fill.
+        Snapshot-fill must NOT try to .fill() this — it's a directory picker,
+        not a text field, and typing into it does nothing useful.
+        """
         return [
             "how did you hear",
             "job title",
@@ -461,260 +751,22 @@ class WorkdayHandler(BaseATSHandler):
 
     async def _js_scroll_and_click(self, page: Any, locator: Any) -> None:
         """
-        Scroll an element into view via JS (works inside nested scroll containers
-        that Playwright's built-in scroll_into_view_if_needed misses) and focus it.
-        Uses JS scrollIntoView + focus as a reliable alternative to click for
-        elements (like spinbuttons) trapped in nested scrollable containers.
+        Click an element via JS el.click() — bypasses Playwright's viewport
+        assertion which fails on Workday's nested scroll containers.
         """
         try:
             element_handle = await maybe_await(locator.element_handle(timeout=5000))
             if element_handle:
-                await maybe_await(page.evaluate(
-                    "(el) => { el.scrollIntoView({block: 'center', behavior: 'instant'}); el.focus(); }",
-                    element_handle,
-                ))
+                await maybe_await(page.evaluate("(el) => el.click()", element_handle))
                 await asyncio.sleep(0.3)
                 return
         except Exception:
             pass
-        # Fallback: try Playwright's focus method
+        # Fallback: force click via Playwright
         try:
-            await maybe_await(locator.focus(timeout=5000))
-            await asyncio.sleep(0.2)
-        except Exception:
-            # Last resort: force click
             await maybe_await(locator.click(force=True, timeout=5000))
-
-    async def _fill_spinbutton(self, page: Any, label_text: str, value: str) -> bool:
-        """
-        Fill a Workday spinbutton field by locating it via its label.
-        Workday dates use <input role='spinbutton'> for Month and Year.
-        ``label_text`` should be something like 'Month' or 'Year'.
-        ``value`` is the numeric string to enter (e.g. '08' for August, '2025').
-        """
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        try:
-            sb = locator_fn(f"input[role='spinbutton'][aria-label='{label_text}']").first
-            if not await maybe_await(sb.is_visible()):
-                return False
-            await maybe_await(sb.click())
-            await maybe_await(sb.fill(value))
-            return True
-        except Exception as exc:
-            logger.debug("[Workday] spinbutton '%s' fill failed: %s", label_text, exc)
-            return False
-
-    async def _set_workday_date_mmyyyy(
-        self, page: Any, container_selector: str, month: str, year: str,
-    ) -> bool:
-        """
-        Fill a Workday MM/YYYY date field inside a container.
-        ``container_selector`` should scope to the specific date-group
-        (e.g. ``[data-automation-id='formField-startDate']`` or a
-        section-scoped selector like ``#workExp [data-automation-id='formField-startDate']``).
-        ``month`` = '01'..'12', ``year`` = '2025'.
-        """
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        ok = True
-        try:
-            container = locator_fn(container_selector).first
-            month_sb = container.locator("input[role='spinbutton'][aria-label='Month']").first
-            year_sb = container.locator("input[role='spinbutton'][aria-label='Year']").first
-            await maybe_await(month_sb.click())
-            await maybe_await(month_sb.fill(month))
-            await asyncio.sleep(0.2)
-            await maybe_await(year_sb.click())
-            await maybe_await(year_sb.fill(year))
-        except Exception as exc:
-            logger.debug("[Workday] date MM/YYYY fill failed for %s: %s", container_selector, exc)
-            ok = False
-        return ok
-
-    async def _set_workday_date_yyyy(
-        self, page: Any, container_selector: str, year: str,
-    ) -> bool:
-        """Fill a Workday YYYY-only date (education From/To)."""
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        try:
-            container = locator_fn(container_selector).first
-            year_sb = container.locator("input[role='spinbutton'][aria-label='Year']").first
-            await maybe_await(year_sb.click())
-            await maybe_await(year_sb.fill(year))
-            return True
-        except Exception as exc:
-            logger.debug("[Workday] date YYYY fill failed for %s: %s", container_selector, exc)
-            return False
-
-    async def _set_workday_date_in_section(
-        self, page: Any, section_locator: Any,
-        date_automation_id: str, month: str | None, year: str,
-    ) -> bool:
-        """
-        Fill a date within a specific section locator scope.
-        This avoids conflicts when multiple sections have the same
-        data-automation-id (e.g. both Work Experience and Education have
-        formField-startDate).
-        Scrolls the element into view first to avoid viewport issues.
-        """
-        try:
-            container = section_locator.locator(
-                f"[data-automation-id='{date_automation_id}']"
-            ).first
-            if month:
-                month_sb = container.locator("input[role='spinbutton'][aria-label='Month']").first
-                await maybe_await(month_sb.scroll_into_view_if_needed(timeout=5000))
-                await asyncio.sleep(0.2)
-                await maybe_await(month_sb.click(timeout=5000))
-                await maybe_await(month_sb.fill(month))
-                await asyncio.sleep(0.2)
-            year_sb = container.locator("input[role='spinbutton'][aria-label='Year']").first
-            await maybe_await(year_sb.scroll_into_view_if_needed(timeout=5000))
-            await asyncio.sleep(0.2)
-            await maybe_await(year_sb.click(timeout=5000))
-            await maybe_await(year_sb.fill(year))
-            logger.debug("[Workday] Filled date %s: month=%s year=%s", date_automation_id, month, year)
-            return True
-        except Exception as exc:
-            logger.debug("[Workday] section-scoped date fill failed (%s): %s", date_automation_id, exc)
-            return False
-
-    async def _click_add_button(self, page: Any, section_label: str) -> bool:
-        """
-        Click the Workday 'Add' button for an expandable section.
-        ``section_label`` like 'Work Experience' or 'Education'.
-        """
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        try:
-            # Workday Add buttons: button[aria-label='Add Work Experience'] or
-            # a generic 'Add' inside a labelled section
-            add_btn = locator_fn(
-                f"button[aria-label*='Add {section_label}'], "
-                f"button[aria-label*='Add']:near(:text('{section_label}'))"
-            ).first
-            if await maybe_await(add_btn.is_visible()):
-                await maybe_await(add_btn.click(timeout=3000))
-                await asyncio.sleep(1.0)
-                logger.debug("[Workday] Clicked 'Add' for %s", section_label)
-                return True
-            # Fallback: look for the exact text pattern
-            add_generic = locator_fn(f"button:has-text('Add'):near(:text('{section_label}'))").first
-            if await maybe_await(add_generic.is_visible()):
-                await maybe_await(add_generic.click(timeout=3000))
-                await asyncio.sleep(1.0)
-                logger.debug("[Workday] Clicked generic 'Add' for %s", section_label)
-                return True
-        except Exception as exc:
-            logger.debug("[Workday] _click_add_button(%s) failed: %s", section_label, exc)
-        return False
-
-    async def _fill_textbox_by_automation_id(
-        self, page: Any, automation_id: str, value: str,
-    ) -> bool:
-        """Fill a Workday textbox identified by data-automation-id on its form field."""
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        try:
-            inp = locator_fn(
-                f"[data-automation-id='{automation_id}'] input, "
-                f"[data-automation-id='{automation_id}'] textarea, "
-                f"input[data-automation-id='{automation_id}'], "
-                f"textarea[data-automation-id='{automation_id}']"
-            ).first
-            if await maybe_await(inp.is_visible()):
-                await maybe_await(inp.click())
-                await maybe_await(inp.fill(value))
-                logger.debug("[Workday] Filled %s = '%s'", automation_id, value[:40])
-                return True
-        except Exception as exc:
-            logger.debug("[Workday] fill %s failed: %s", automation_id, exc)
-        return False
-
-    async def _fill_textbox_by_label(
-        self, page: Any, label_pattern: str, value: str,
-    ) -> bool:
-        """Fill a textbox found near a label matching ``label_pattern`` (case-insensitive)."""
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        try:
-            label_loc = locator_fn(f"text=/{label_pattern}/i").first
-            if not await maybe_await(label_loc.is_visible()):
-                return False
-            # Walk up to the form-field container, then find the input
-            form_field = label_loc.locator("xpath=ancestor::*[@data-automation-id and contains(@data-automation-id,'formField')]").first
-            inp = form_field.locator("input, textarea").first
-            if await maybe_await(inp.is_visible()):
-                await maybe_await(inp.click())
-                await maybe_await(inp.fill(value))
-                logger.debug("[Workday] Filled label '%s' = '%s'", label_pattern, value[:40])
-                return True
         except Exception:
             pass
-        # Fallback: use Playwright's getByLabel
-        try:
-            inp = page.get_by_label(re.compile(label_pattern, re.IGNORECASE)).first
-            if await maybe_await(inp.is_visible()):
-                await maybe_await(inp.click())
-                await maybe_await(inp.fill(value))
-                logger.debug("[Workday] Filled (getByLabel) '%s' = '%s'", label_pattern, value[:40])
-                return True
-        except Exception:
-            pass
-        return False
-
-    async def _select_workday_dropdown(
-        self, page: Any, container_selector: str, option_text: str,
-    ) -> bool:
-        """
-        Select an option from a Workday dropdown button.
-        Clicks the dropdown button, waits for the listbox, then clicks the matching option.
-        """
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return False
-        try:
-            btn = locator_fn(f"{container_selector} button[aria-haspopup='listbox']").first
-            if not await maybe_await(btn.is_visible()):
-                # Try the container itself as the button
-                btn = locator_fn(f"{container_selector} [role='button']").first
-            await maybe_await(btn.click(timeout=3000))
-            await asyncio.sleep(0.8)
-
-            # Look for the option in the listbox
-            opt = locator_fn(f"[role='option']:has-text('{option_text}')").first
-            if await maybe_await(opt.is_visible()):
-                await maybe_await(opt.click(timeout=3000))
-                logger.debug("[Workday] Selected dropdown option '%s'", option_text)
-                return True
-
-            # Try partial match
-            options = locator_fn("[role='option']")
-            count = await maybe_await(options.count())
-            target_lower = option_text.lower()
-            for i in range(count):
-                opt_el = options.nth(i)
-                text = (await maybe_await(opt_el.text_content()) or "").strip().lower()
-                if target_lower in text:
-                    await maybe_await(opt_el.click(timeout=3000))
-                    logger.debug("[Workday] Selected partial-match dropdown '%s'", text[:40])
-                    return True
-
-            # Escape if nothing matched
-            keyboard = getattr(page, "keyboard", None)
-            if keyboard:
-                await maybe_await(keyboard.press("Escape"))
-        except Exception as exc:
-            logger.debug("[Workday] dropdown select failed for %s: %s", container_selector, exc)
-        return False
 
     # ==================================================================
     # Work Experience
@@ -921,32 +973,33 @@ class WorkdayHandler(BaseATSHandler):
         # -- Degree dropdown (button → listbox → click option) --
         # From manual mapping: the button's accessible name includes "Degree"
         # (e.g. "Degree Select One Required"). Click it to open a listbox,
-        # then directly click the matching option — no scrolling needed.
+        # then use fuzzy matching to pick the closest option.
         degree = entry.get("studyType") or entry.get("degree") or ""
         if degree:
-            # Map common values to exact Workday dropdown text (no apostrophes!)
-            degree_map: dict[str, str] = {
-                "bachelor of science": "Bachelor Degree",
-                "bachelor of arts": "Bachelor Degree",
-                "bs": "Bachelor Degree",
-                "ba": "Bachelor Degree",
-                "bachelor": "Bachelor Degree",
-                "master of science": "Master Degree",
-                "master of arts": "Master Degree",
-                "ms": "Master Degree",
-                "ma": "Master Degree",
-                "master": "Master Degree",
-                "phd": "PHD",
-                "doctor of philosophy": "PHD",
-                "doctorate": "PHD",
-                "associate": "Associate Degree/College Diploma (DEC)",
-                "associate of science": "Associate Degree/College Diploma (DEC)",
-                "associate of arts": "Associate Degree/College Diploma (DEC)",
-                "high school": "High School Diploma or Equivalent",
-                "ged": "High School Diploma or Equivalent",
-                "mba": "MBA",
+            # Map common values to a keyword for fuzzy-matching in the dropdown.
+            # We no longer need exact text — just a keyword to score against.
+            degree_keyword_map: dict[str, str] = {
+                "bachelor of science": "bachelor",
+                "bachelor of arts": "bachelor",
+                "bs": "bachelor",
+                "ba": "bachelor",
+                "bachelor": "bachelor",
+                "master of science": "master",
+                "master of arts": "master",
+                "ms": "master",
+                "ma": "master",
+                "master": "master",
+                "phd": "phd",
+                "doctor of philosophy": "phd",
+                "doctorate": "doctorate",
+                "associate": "associate",
+                "associate of science": "associate",
+                "associate of arts": "associate",
+                "high school": "high school",
+                "ged": "high school",
+                "mba": "mba",
             }
-            wd_degree = degree_map.get(degree.lower(), degree)
+            degree_keyword = degree_keyword_map.get(degree.lower(), degree.lower())
 
             try:
                 # Find the Degree button via role — its accessible name contains "Degree"
@@ -955,31 +1008,77 @@ class WorkdayHandler(BaseATSHandler):
                 await maybe_await(degree_btn.click(timeout=5000))
                 await asyncio.sleep(0.8)
 
-                # Click the matching option in the listbox directly (no scroll needed)
-                opt = locator_fn(f"[role='option']:has-text('{wd_degree}')").first
-                if await maybe_await(opt.is_visible(timeout=3000)):
-                    await maybe_await(opt.click(timeout=3000))
-                    logger.debug("[Workday] Edu: Degree = '%s'", wd_degree)
+                # Collect all options and their text
+                # Use :visible to avoid hidden listboxes; Degree dropdown doesn't
+                # use the "Expanded" aria-label pattern, it's a standard dropdown.
+                options = locator_fn("[role='listbox']:visible [role='option']")
+                count = await maybe_await(options.count())
+                option_texts: list[tuple[int, str]] = []
+                for i in range(count):
+                    opt_el = options.nth(i)
+                    text = (await maybe_await(opt_el.text_content()) or "").strip()
+                    if text:
+                        option_texts.append((i, text))
+
+                logger.debug(
+                    "[Workday] Edu: Degree options (%d): %s",
+                    len(option_texts),
+                    [t for _, t in option_texts],
+                )
+
+                # Fuzzy scoring: find option whose text best matches the keyword.
+                # Score = number of keyword chars that appear as a subsequence,
+                # with bonus for exact substring containment.
+                best_idx = -1
+                best_score = -1
+                best_text = ""
+                keyword_lower = degree_keyword.lower()
+
+                for i, text in option_texts:
+                    text_lower = text.lower()
+                    score = 0
+                    # Big bonus for exact substring match
+                    if keyword_lower in text_lower:
+                        score += 1000
+                    # Bonus for each keyword word found in the option text
+                    for word in keyword_lower.split():
+                        if word in text_lower:
+                            score += 100
+                    # Small bonus for shorter options (prefer "Bachelor's Degree"
+                    # over "Bachelor's Degree in Applied Science")
+                    score -= len(text) * 0.1
+
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+                        best_text = text
+
+                if best_idx >= 0 and best_score > 0:
+                    await maybe_await(options.nth(best_idx).click(timeout=3000))
+                    logger.debug(
+                        "[Workday] Edu: Degree = '%s' (score=%.1f, keyword='%s')",
+                        best_text, best_score, keyword_lower,
+                    )
                 else:
-                    # Partial match fallback
-                    options = locator_fn("[role='listbox'] [role='option']")
-                    count = await maybe_await(options.count())
-                    target_lower = wd_degree.lower()
-                    for i in range(count):
-                        opt_el = options.nth(i)
-                        text = (await maybe_await(opt_el.text_content()) or "").strip().lower()
-                        if target_lower in text:
-                            await maybe_await(opt_el.click(timeout=3000))
-                            logger.debug("[Workday] Edu: Degree partial match = '%s'", text)
-                            break
-                    else:
-                        # Escape if nothing matched
-                        keyboard = getattr(page, "keyboard", None)
-                        if keyboard:
-                            await maybe_await(keyboard.press("Escape"))
-                        logger.debug("[Workday] Edu: Degree option '%s' not found", wd_degree)
+                    # Nothing matched at all — close dropdown
+                    keyboard = getattr(page, "keyboard", None)
+                    if keyboard:
+                        await maybe_await(keyboard.press("Escape"))
+                    logger.debug(
+                        "[Workday] Edu: Degree option not found for keyword '%s'",
+                        keyword_lower,
+                    )
             except Exception as exc:
                 logger.debug("[Workday] Edu: Degree dropdown failed: %s", exc)
+
+            # Ensure degree dropdown is fully dismissed
+            try:
+                mouse = getattr(page, "mouse", None)
+                if mouse:
+                    await maybe_await(mouse.click(10, 10))
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
 
         # -- Field of Study (search + radio picker, single-select) --
         area = entry.get("area") or ""
@@ -1099,8 +1198,9 @@ class WorkdayHandler(BaseATSHandler):
             await asyncio.sleep(1.5)  # Wait for search results to load
 
             # Click the first matching option from the results
-            # Try exact-ish match first, then first visible option
-            options = locator_fn("[role='option']")
+            # FoS runs before skills are filled, so no conflicting "selected items"
+            # listbox exists yet — safe to use the broad :visible selector here.
+            options = locator_fn("[role='listbox']:visible [role='option']")
             count = await maybe_await(options.count())
             target_lower = search_term.lower()
             clicked = False
@@ -1136,16 +1236,19 @@ class WorkdayHandler(BaseATSHandler):
                 await maybe_await(keyboard.press("Escape"))
                 logger.debug("[Workday] Field of Study: no matching option for '%s'", search_term)
 
-            # Dismiss the Field of Study dropdown by clicking a neutral element
-            # (Escape alone doesn't close this Workday dropdown reliably)
-            # Target: progress bar heading — always visible, never interactive
+            # Dismiss the Field of Study dropdown fully before moving on.
+            # The popup can intercept clicks on subsequent fields (e.g. GPA).
+            # Strategy: Escape first, then click neutral whitespace via mouse.
             try:
-                neutral = locator_fn(
-                    "[data-automation-id='progressBar'], "
-                    "[data-automation-id='pageHeaderTitle'], h2"
-                ).first
-                await maybe_await(neutral.click(force=True, timeout=2000))
-                await asyncio.sleep(0.5)
+                await maybe_await(keyboard.press("Escape"))
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+            try:
+                mouse = getattr(page, "mouse", None)
+                if mouse:
+                    await maybe_await(mouse.click(10, 10))
+                    await asyncio.sleep(0.5)
             except Exception:
                 pass
 
@@ -1220,7 +1323,7 @@ class WorkdayHandler(BaseATSHandler):
                     el_handle = await maybe_await(search_input.element_handle(timeout=3000))
                     if el_handle:
                         await maybe_await(page.evaluate(
-                            "(el) => { el.scrollIntoView({block: 'center'}); el.focus(); el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); }",
+                            "(el) => { el.click(); el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); }",
                             el_handle,
                         ))
                         await asyncio.sleep(0.3)
@@ -1232,7 +1335,14 @@ class WorkdayHandler(BaseATSHandler):
                     await asyncio.sleep(0.2)
 
                 # Type the search term and hit Enter to trigger search
-                all_opts = locator_fn("[role='option']")
+                # Scope to the SEARCH RESULTS listbox only — Workday renders
+                # "selected items" as a separate [role='listbox'] with
+                # aria-label="items selected". The search results listbox has
+                # aria-label containing "Expanded". Using the global
+                # [role='listbox']:visible selector would pick up options from
+                # BOTH, causing us to click "Computer Science" (a FoS selected
+                # item) instead of the actual skill option.
+                all_opts = locator_fn("[role='listbox'][aria-label*='Expanded'] [role='option']")
                 stale_count = await maybe_await(all_opts.count())
                 await maybe_await(search_input.fill(term))
                 await asyncio.sleep(0.3)
@@ -1341,6 +1451,25 @@ class WorkdayHandler(BaseATSHandler):
         except Exception:
             logger.debug("[Workday] Skills section not found — skipping.")
             return
+
+        # Extra safety: dismiss any lingering Field of Study dropdown before we start.
+        # The Field of Study and Skills inputs share similar DOM patterns
+        # (both are multiselect search boxes), so a leftover open Field of Study
+        # listbox can interfere with Skills selection.
+        keyboard = getattr(page, "keyboard", None)
+        mouse = getattr(page, "mouse", None)
+        try:
+            fos_input = page.get_by_role("textbox", name="Field of Study")
+            if await maybe_await(fos_input.count()) > 0:
+                # Click away from Field of Study to ensure it's not focused
+                if keyboard:
+                    await maybe_await(keyboard.press("Escape"))
+                    await asyncio.sleep(0.2)
+                if mouse:
+                    await maybe_await(mouse.click(10, 10))
+                    await asyncio.sleep(0.3)
+        except Exception:
+            pass
 
         # Build skill list from profile + JD
         skill_set: list[str] = []
@@ -1504,9 +1633,6 @@ class WorkdayHandler(BaseATSHandler):
         try:
             handle = await maybe_await(add_btn.element_handle(timeout=3000))
             if handle:
-                await maybe_await(page.evaluate("(el) => el.scrollIntoView({block: 'center'})", handle))
-                await asyncio.sleep(0.3)
-                # Use JS click — Workday React handlers sometimes don't respond to Playwright's click
                 await maybe_await(page.evaluate("(el) => el.click()", handle))
             else:
                 await maybe_await(add_btn.click(timeout=3000))
@@ -1600,16 +1726,9 @@ class WorkdayHandler(BaseATSHandler):
             logger.debug("[Workday] Website URL: no input found after clicking Add.")
             return
 
-        # ---- Step 4: Scroll, focus, and fill ----
+        # ---- Step 4: Click and fill ----
         try:
             await maybe_await(url_inp.wait_for(state="visible", timeout=5000))
-        except Exception:
-            pass
-        try:
-            handle = await maybe_await(url_inp.element_handle(timeout=3000))
-            if handle:
-                await maybe_await(page.evaluate("(el) => { el.scrollIntoView({block: 'center'}); el.focus(); }", handle))
-                await asyncio.sleep(0.3)
         except Exception:
             pass
         try:
@@ -1646,6 +1765,13 @@ class WorkdayHandler(BaseATSHandler):
 
         # Fill LinkedIn
         if linkedin_url:
+            # Workday requires URLs to start with https://www.
+            if linkedin_url.startswith("https://linkedin.com"):
+                linkedin_url = linkedin_url.replace("https://linkedin.com", "https://www.linkedin.com", 1)
+            elif linkedin_url.startswith("http://linkedin.com"):
+                linkedin_url = linkedin_url.replace("http://linkedin.com", "https://www.linkedin.com", 1)
+            elif linkedin_url.startswith("linkedin.com"):
+                linkedin_url = "https://www." + linkedin_url
             try:
                 inp = page.get_by_role("textbox", name="LinkedIn")
                 await maybe_await(inp.scroll_into_view_if_needed(timeout=5000))

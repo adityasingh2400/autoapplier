@@ -5,7 +5,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from openclaw.answer_bank import expand_placeholders, is_human_sentinel, normalize_text, match_question_bank, normalize_text_fuzzy
 from openclaw.auth import maybe_auto_authenticate
@@ -103,6 +103,23 @@ class BaseATSHandler:
     field_selectors: dict[str, list[str]] = field(default_factory=dict)
     _last_detected_page: str | None = field(default=None, repr=False)
     _pages_filled: set = field(default_factory=set, repr=False)
+
+    # Deterministic dispatch table: kind -> method name.
+    # Each protocol has signature: async def _proto_X(self, page, answer, ctrl) -> bool
+    # ATS subclasses can override to add/replace protocols.
+    _FILL_PROTOCOLS: ClassVar[dict[str, str]] = {
+        "native_select":           "_proto_native_select",
+        "native_text":             "_proto_native_text",
+        "native_radio":            "_proto_native_radio",
+        "native_checkbox":         "_proto_native_checkbox",
+        "checkbox_group":          "_proto_checkbox_group",
+        "workday_date":            "_proto_workday_date",
+        "aria_combobox":           "_proto_aria_combobox",
+        "aria_radio":              "_proto_aria_radio",
+        "aria_checkbox":           "_proto_aria_checkbox",
+        "workday_button_dropdown": "_proto_workday_button_dropdown",
+        "react_select":            "_proto_react_select",
+    }
 
     async def apply(self, page: Any, ctx: ApplyContext) -> dict[str, Any]:
         fields_filled = 0
@@ -235,8 +252,31 @@ class BaseATSHandler:
         cover_letter_uploaded = False
         _cl_gen_task: _asyncio.Task | None = None  # background cover letter generation
         _cl_pdf_path: Path | None = None  # cached CL path once generated
+        _prev_page_signature: str | None = None  # stale-page detection
+        _stale_count = 0  # how many times the page didn't change after "Next"
         for page_index in range(max(ctx.max_form_pages, 1)):
             logger.info("[%s] === Form page %d/%d ===", ctx.company, page_index + 1, ctx.max_form_pages)
+
+            # ── Stale-page detection ──
+            # Take a lightweight "signature" of the page (visible control IDs/names).
+            # If it matches the previous iteration, Next didn't actually advance.
+            page_sig = await self._page_signature(page)
+            if page_sig and page_sig == _prev_page_signature:
+                _stale_count += 1
+                logger.warning(
+                    "[%s] Page did not change after clicking Next (stale count=%d). "
+                    "Likely a required field is blocking advancement.",
+                    ctx.company, _stale_count,
+                )
+                if _stale_count >= 2:
+                    logger.error(
+                        "[%s] Stuck on the same page after %d attempts — breaking loop.",
+                        ctx.company, _stale_count,
+                    )
+                    break
+            else:
+                _stale_count = 0
+            _prev_page_signature = page_sig
 
             # Kick off cover letter generation concurrently on the first page.
             # The LLM call + PDF render don't touch the browser, so they run safely
@@ -245,40 +285,41 @@ class BaseATSHandler:
                 _cl_gen_task = _asyncio.create_task(self._generate_cover_letter_pdf(ctx))
 
             # --- Pre-fill special controls FIRST (e.g. Workday directory pickers, page-specific widgets) ---
-            # This also detects the page type, and fills structured fields (work experience, education, skills)
-            # before attempting file uploads (which may not exist on every page).
+            # This also waits for the page to be ready (via _wait_for_page_ready override).
             await self._pre_fill_special_controls(page, ctx)
 
-            if not resume_uploaded:
-                resume_path = ctx.resume_path_override or ctx.profile.resume_pdf_path
-                logger.info("[%s] Uploading resume: %s", ctx.company, resume_path)
-                uploaded = await self._upload_resume_if_available(page, resume_path, ctx)
-                fields_filled += uploaded
-                resume_uploaded = uploaded > 0
-                if resume_uploaded:
-                    logger.info("[%s] Resume uploaded successfully.", ctx.company)
-                else:
-                    logger.debug("[%s] Resume upload: no file input found or upload skipped.", ctx.company)
-
-            # Upload cover letter — await the background generation if still running
-            if not cover_letter_uploaded:
-                if _cl_gen_task is not None:
-                    _cl_pdf_path = await _cl_gen_task
-                    _cl_gen_task = None  # consumed
-                elif _cl_pdf_path is None:
-                    _cl_pdf_path = self._find_existing_cover_letter_pdf(ctx)
-                if _cl_pdf_path:
-                    uploaded = await smart_upload(
-                        page,
-                        prompt="Upload cover letter",
-                        file_path=_cl_pdf_path,
-                        selectors=self.cover_letter_selectors,
-                    )
-                    if uploaded:
-                        logger.info("[%s] Cover letter uploaded successfully.", ctx.company)
-                        cover_letter_uploaded = True
+            # Only attempt file uploads when we're on a new page (not stuck on a stale one).
+            if _stale_count == 0:
+                if not resume_uploaded:
+                    resume_path = ctx.resume_path_override or ctx.profile.resume_pdf_path
+                    logger.info("[%s] Uploading resume: %s", ctx.company, resume_path)
+                    uploaded = await self._upload_resume_if_available(page, resume_path, ctx)
+                    fields_filled += uploaded
+                    resume_uploaded = uploaded > 0
+                    if resume_uploaded:
+                        logger.info("[%s] Resume uploaded successfully.", ctx.company)
                     else:
-                        logger.debug("[%s] No cover letter upload field found (may not be required).", ctx.company)
+                        logger.debug("[%s] Resume upload: no file input found or upload skipped.", ctx.company)
+
+                # Upload cover letter — await the background generation if still running
+                if not cover_letter_uploaded:
+                    if _cl_gen_task is not None:
+                        _cl_pdf_path = await _cl_gen_task
+                        _cl_gen_task = None  # consumed
+                    elif _cl_pdf_path is None:
+                        _cl_pdf_path = self._find_existing_cover_letter_pdf(ctx)
+                    if _cl_pdf_path:
+                        uploaded = await smart_upload(
+                            page,
+                            prompt="Upload cover letter",
+                            file_path=_cl_pdf_path,
+                            selectors=self.cover_letter_selectors,
+                        )
+                        if uploaded:
+                            logger.info("[%s] Cover letter uploaded successfully.", ctx.company)
+                            cover_letter_uploaded = True
+                        else:
+                            logger.debug("[%s] No cover letter upload field found (may not be required).", ctx.company)
 
             # --- Unified snapshot-and-fill: one pass over all empty fields ---
             logger.info("[%s] Snapshot-and-fill: scanning all empty fields...", ctx.company)
@@ -298,6 +339,7 @@ class BaseATSHandler:
                 logger.info("[%s] No Next/Continue button found — assuming single-page form.", ctx.company)
                 break
             logger.info("[%s] Clicked Next/Continue — advancing to page %d.", ctx.company, page_index + 2)
+
             await capture_step(page, ctx.output_dir, f"02-next-{page_index+1:02d}", ctx.screenshots)
 
             auth_mid = await maybe_auto_authenticate(
@@ -599,296 +641,6 @@ class BaseATSHandler:
         except Exception:
             return ""
 
-    async def _fill_standard_fields(self, page: Any, standard_fields: dict[str, str]) -> int:
-        count = 0
-        prefilled = await self._extract_prefilled_values(page)
-        if prefilled:
-            logger.debug("  Prefilled values detected: %s", list(prefilled.keys()))
-
-        # Build the ordered list of fields we want to fill.
-        preferred_order = [
-            "first_name",
-            "last_name",
-            "full_name",
-            "email",
-            "phone",
-            "linkedin",
-            "github",
-            "school",
-            "degree",
-            "gpa",
-            "graduation",
-        ]
-        seen: set[str] = set()
-        ordered_items: list[tuple[str, str]] = []
-        for key in preferred_order:
-            if key in standard_fields:
-                ordered_items.append((key, standard_fields.get(key, "")))
-                seen.add(key)
-        for key, value in standard_fields.items():
-            if key not in seen:
-                ordered_items.append((key, value))
-
-        # Filter out fields we don't need to fill.
-        to_fill: list[tuple[str, str]] = []
-        for key, value in ordered_items:
-            if not value:
-                continue
-            if prefilled.get(key):
-                continue
-            if (
-                key == "full_name"
-                and standard_fields.get("first_name")
-                and standard_fields.get("last_name")
-                and key not in self.field_selectors
-            ):
-                continue
-            to_fill.append((key, value))
-
-        if not to_fill:
-            return 0
-
-        # --- Scan-first: find all empty text/email/tel/url inputs on the page ---
-        evaluate_fn = getattr(page, "evaluate", None)
-        locator_fn = getattr(page, "locator", None)
-        dom_fields: list[dict[str, str]] = []
-        if evaluate_fn is not None:
-            scan_script = """
-            () => {
-              const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-              const cssEscape = (v) => {
-                try { return (window.CSS && CSS.escape) ? CSS.escape(String(v || "")) : String(v || ""); }
-                catch (e) { return String(v || ""); }
-              };
-              const isHidden = (el) => {
-                if (!el) return true;
-                try {
-                  const rect = el.getBoundingClientRect();
-                  if (!rect || rect.width < 2 || rect.height < 2) return true;
-                } catch (e) { return true; }
-                let cur = el;
-                for (let i = 0; i < 5 && cur; i += 1) {
-                  try {
-                    const ariaHidden = normalize(cur.getAttribute ? (cur.getAttribute("aria-hidden") || "") : "");
-                    if (ariaHidden === "true") return true;
-                    const style = window.getComputedStyle(cur);
-                    if (style.display === "none" || style.visibility === "hidden") return true;
-                  } catch (e) {}
-                  cur = cur.parentElement;
-                }
-                return false;
-              };
-              const labelTextFor = (el) => {
-                const pieces = [];
-                const aria = el.getAttribute("aria-label");
-                if (aria) pieces.push(aria);
-                const labelledBy = el.getAttribute("aria-labelledby");
-                if (labelledBy) {
-                  for (const id of labelledBy.split(/\\s+/)) {
-                    const n = document.getElementById(id);
-                    if (n?.innerText) pieces.push(n.innerText);
-                  }
-                }
-                if (el.id) {
-                  const byFor = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
-                  if (byFor?.innerText) pieces.push(byFor.innerText);
-                }
-                const wrap = el.closest("label");
-                if (wrap?.innerText) pieces.push(wrap.innerText);
-                const placeholder = el.getAttribute("placeholder");
-                if (placeholder) pieces.push(placeholder);
-                const name = el.getAttribute("name");
-                if (name) pieces.push(name);
-                return pieces.join(" ").replace(/\\s+/g, " ").trim();
-              };
-              const selectorFor = (el) => {
-                if (!el) return "";
-                if (el.id) return "#" + cssEscape(el.id);
-                const name = el.getAttribute("name");
-                if (name) return `${el.tagName.toLowerCase()}[name="${cssEscape(name)}"]`;
-                const parts = [];
-                let cur = el;
-                for (let i = 0; i < 5 && cur && cur.nodeType === 1; i += 1) {
-                  const tag = cur.tagName.toLowerCase();
-                  let index = 1;
-                  let sib = cur.previousElementSibling;
-                  while (sib) {
-                    if (sib.tagName === cur.tagName) index += 1;
-                    sib = sib.previousElementSibling;
-                  }
-                  parts.unshift(`${tag}:nth-of-type(${index})`);
-                  cur = cur.parentElement;
-                }
-                return parts.join(" > ");
-              };
-
-              const out = [];
-              const inputs = document.querySelectorAll("input, textarea, select");
-              for (const el of inputs) {
-                if (el.disabled || el.readOnly) continue;
-                const tag = (el.tagName || "").toLowerCase();
-                const type = normalize(el.type || "");
-                if (type === "hidden" || type === "password" || type === "submit" ||
-                    type === "button" || type === "reset" || type === "file" ||
-                    type === "checkbox" || type === "radio") continue;
-                if (isHidden(el)) continue;
-                // Only include empty fields.
-                if (tag === "select") {
-                  // Select is "empty" if no option or first (placeholder) is selected.
-                  const idx = el.selectedIndex;
-                  const opt = el.options[idx];
-                  const val = opt ? normalize(opt.value) : "";
-                  if (val && val !== "" && idx > 0) continue;
-                } else {
-                  if ((el.value || "").trim()) continue;
-                }
-                const label = labelTextFor(el);
-                if (!label) continue;
-                const sel = selectorFor(el);
-                if (!sel) continue;
-                out.push({ label: normalize(label), selector: sel, tag, type: type || "text" });
-              }
-              return out;
-            }
-            """
-            try:
-                dom_fields = await maybe_await(evaluate_fn(scan_script))
-                if not isinstance(dom_fields, list):
-                    dom_fields = []
-            except Exception:
-                dom_fields = []
-
-        if dom_fields and locator_fn:
-            logger.debug("  DOM scan found %d empty input field(s) for standard field matching.", len(dom_fields))
-            # Map standard field keys to keywords for matching.
-            key_keywords: dict[str, list[str]] = {
-                "first_name": ["first name", "first_name", "firstname", "given name"],
-                "last_name": ["last name", "last_name", "lastname", "surname", "family name"],
-                "full_name": ["full name", "full_name", "fullname", "your name", "name"],
-                "email": ["email", "e-mail", "email address"],
-                "phone": ["phone", "telephone", "mobile", "cell"],
-                "linkedin": ["linkedin"],
-                "github": ["github"],
-                "school": ["school", "university", "college", "institution"],
-                "degree": ["degree"],
-                "gpa": ["gpa", "grade point"],
-                "graduation": ["graduation", "grad date", "grad year"],
-            }
-
-            filled_keys: set[str] = set()
-            for key, value in to_fill:
-                keywords = key_keywords.get(key, [key.replace("_", " ")])
-                best_field = None
-                best_score = -1
-                for df in dom_fields:
-                    lbl = df.get("label", "")
-                    for kw in keywords:
-                        if kw in lbl:
-                            score = len(kw)
-                            if score > best_score:
-                                best_score = score
-                                best_field = df
-                if best_field is not None:
-                    sel = best_field["selector"]
-                    try:
-                        loc = locator_fn(sel).first
-                        tag = best_field.get("tag", "")
-                        if tag == "select":
-                            select_opt_fn = getattr(loc, "select_option", None)
-                            if select_opt_fn:
-                                try:
-                                    await maybe_await(select_opt_fn(label=value, timeout=1500))
-                                    count += 1
-                                    filled_keys.add(key)
-                                    logger.debug("  Filled standard field (scan): %s = %s", key, value[:40])
-                                    continue
-                                except Exception:
-                                    try:
-                                        await maybe_await(select_opt_fn(value=value, timeout=1500))
-                                        count += 1
-                                        filled_keys.add(key)
-                                        logger.debug("  Filled standard field (scan): %s = %s", key, value[:40])
-                                        continue
-                                    except Exception:
-                                        pass
-                        else:
-                            await maybe_await(loc.fill(value, timeout=1500))
-                            count += 1
-                            filled_keys.add(key)
-                            logger.debug("  Filled standard field (scan): %s = %s", key, value[:40])
-                    except Exception:
-                        logger.debug("  Failed to fill via scan: %s -> %s", key, sel[:40], exc_info=True)
-
-            # Fallback: for fields not matched by scan, try ATS-specific selectors only.
-            for key, value in to_fill:
-                if key in filled_keys:
-                    continue
-                selectors = self.field_selectors.get(key)
-                if not selectors:
-                    continue
-                prompt = self.field_prompts.get(key, key.replace("_", " ").title())
-                if await smart_fill(page, prompt=prompt, value=value, selectors=selectors):
-                    logger.debug("  Filled standard field (selector): %s = %s", key, value[:40] if len(value) > 40 else value)
-                    count += 1
-        else:
-            # No DOM scan available, fall back to original smart_fill loop.
-            for key, value in to_fill:
-                prompt = self.field_prompts.get(key, key.replace("_", " ").title())
-                selectors = self.field_selectors.get(key)
-                if await smart_fill(page, prompt=prompt, value=value, selectors=selectors):
-                    logger.debug("  Filled standard field: %s = %s", key, value[:40] if len(value) > 40 else value)
-                    count += 1
-        return count
-
-    async def _extract_prefilled_values(self, page: Any) -> dict[str, str]:
-        evaluate_fn = getattr(page, "evaluate", None)
-        if evaluate_fn is None:
-            return {}
-        script = """
-        () => {
-          const out = {};
-          const keys = [
-            "first", "last", "name", "email", "phone",
-            "linkedin", "github", "school", "university",
-            "degree", "gpa", "graduation", "grad"
-          ];
-
-          const inputs = Array.from(document.querySelectorAll("input, textarea, select"));
-          for (const el of inputs) {
-            const name = (el.getAttribute("name") || "").toLowerCase();
-            const id = (el.id || "").toLowerCase();
-            const placeholder = (el.getAttribute("placeholder") || "").toLowerCase();
-            const label = (
-              (el.closest("label")?.innerText || "") +
-              " " +
-              (document.querySelector(`label[for='${el.id}']`)?.innerText || "")
-            ).toLowerCase();
-            const hay = `${name} ${id} ${placeholder} ${label}`;
-            const value = ("value" in el ? (el.value || "") : "").trim();
-            if (!value) continue;
-            if (hay.includes("first")) out.first_name = value;
-            if (hay.includes("last")) out.last_name = value;
-            if (hay.includes("full") || hay.includes("name")) out.full_name = value;
-            if (hay.includes("email")) out.email = value;
-            if (hay.includes("phone")) out.phone = value;
-            if (hay.includes("linkedin")) out.linkedin = value;
-            if (hay.includes("github")) out.github = value;
-            if (hay.includes("school") || hay.includes("university")) out.school = value;
-            if (hay.includes("degree")) out.degree = value;
-            if (hay.includes("gpa")) out.gpa = value;
-            if (hay.includes("graduation") || hay.includes("grad")) out.graduation = value;
-          }
-          return out;
-        }
-        """
-        try:
-            result = await maybe_await(evaluate_fn(script))
-            if isinstance(result, dict):
-                return {str(k): str(v) for k, v in result.items() if str(v).strip()}
-        except Exception:
-            return {}
-        return {}
-
     async def _upload_resume_if_available(self, page: Any, resume_pdf_path: Path, ctx: ApplyContext | None = None) -> int:
         if not resume_pdf_path.exists():
             logger.warning("Resume file does not exist: %s", resume_pdf_path)
@@ -1015,1718 +767,6 @@ class BaseATSHandler:
 
         logger.info("[%s] Cover letter PDF saved: %s", ctx.company, filename)
         return pdf_path
-
-    async def _fill_standard_questions(self, page: Any, ctx: ApplyContext | None = None) -> int:
-        evaluate_fn = getattr(page, "evaluate", None)
-        if evaluate_fn is None:
-            return 0
-
-        how_heard_answer = "Online Job Board"
-        source_hint = ""
-        try:
-            source_hint = str(getattr(ctx, "source", "") or "")
-        except Exception:
-            source_hint = ""
-        if source_hint.strip().lower() in {"simplify", "simplifyjobs"}:
-            how_heard_answer = "SimplifyJobs (GitHub)"
-
-        template_values: dict[str, str] = {}
-        if ctx is not None:
-            try:
-                template_values.update(dict(getattr(ctx.profile, "standard_fields", {}) or {}))
-            except Exception:
-                pass
-            template_values.setdefault("company", ctx.company)
-            template_values.setdefault("role", ctx.role)
-        template_values.setdefault("how_heard", how_heard_answer)
-
-        bank_mappings: list[tuple[str, str]] = []
-        if ctx is not None:
-            try:
-                for needle, answer in list(getattr(ctx.profile, "question_bank", []) or []):
-                    bank_mappings.append((str(needle), expand_placeholders(str(answer), template_values)))
-            except Exception:
-                pass
-
-        mappings: list[tuple[str, str]] = []
-        mappings.extend(bank_mappings)
-
-        # Low-risk defaults (can be overridden by question_bank entries above).
-        mappings.extend(
-            [
-                ("how did you hear", how_heard_answer),
-                ("where did you hear", how_heard_answer),
-                ("source", how_heard_answer),
-                ("start date", "Summer 2026"),
-                ("when can you start", "Summer 2026"),
-                ("available to start", "Summer 2026"),
-                ("salary expectation", "Open / Negotiable"),
-                ("compensation expectation", "Open / Negotiable"),
-                ("desired salary", "Open / Negotiable"),
-                ("referral", "No"),
-                ("referred", "No"),
-            ]
-        )
-        script = """
-        (mappings) => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-          const isHuman = (ans) => {
-            const a = normalize(ans);
-            if (!a) return true;
-            if (a === "__human__" || a === "__ask__" || a === "__manual__" || a === "__skip__") return true;
-            return a.startsWith("__human");
-          };
-
-          const safeFocus = (el) => {
-            // Avoid scroll-jank when filling many fields.
-            try { el && el.focus && el.focus({ preventScroll: true }); } catch (e) {}
-          };
-
-          const isHidden = (el) => {
-            if (!el) return true;
-            try {
-              const rect = el.getBoundingClientRect();
-              if (!rect || rect.width < 2 || rect.height < 2) return true;
-            } catch (e) {
-              return true;
-            }
-            let cur = el;
-            for (let i = 0; i < 5 && cur; i += 1) {
-              try {
-                const ariaHidden = normalize(cur.getAttribute ? (cur.getAttribute("aria-hidden") || "") : "");
-                if (ariaHidden === "true") return true;
-                const style = window.getComputedStyle(cur);
-                if (style.display === "none" || style.visibility === "hidden") return true;
-                const opacity = parseFloat(style.opacity || "1");
-                if (!Number.isNaN(opacity) && opacity < 0.05) return true;
-              } catch (e) {}
-              cur = cur.parentElement;
-            }
-            return false;
-          };
-
-          const setNativeValue = (el, value) => {
-            const tag = (el.tagName || "").toLowerCase();
-            const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const desc = Object.getOwnPropertyDescriptor(proto, "value");
-            if (desc && typeof desc.set === "function") desc.set.call(el, value);
-            else el.value = value;
-          };
-
-          const labelTextFor = (el) => {
-            const pieces = [];
-            const aria = el.getAttribute("aria-label");
-            if (aria) pieces.push(aria);
-
-            const labelledBy = el.getAttribute("aria-labelledby");
-            if (labelledBy) {
-              for (const id of labelledBy.split(/\\s+/)) {
-                const n = document.getElementById(id);
-                if (n?.innerText) pieces.push(n.innerText);
-              }
-            }
-
-            if (el.id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-              if (byFor?.innerText) pieces.push(byFor.innerText);
-            }
-
-            const wrap = el.closest("label");
-            if (wrap?.innerText) pieces.push(wrap.innerText);
-
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            for (let i = 0; i < 3 && root; i += 1) {
-              const legend = root.querySelector("legend");
-              if (legend?.innerText) pieces.push(legend.innerText);
-              const labelLike = root.querySelector("label,h3,h4,p,strong,span,div");
-              if (labelLike?.innerText) pieces.push(labelLike.innerText);
-              root = root.parentElement;
-            }
-
-            const placeholder = el.getAttribute("placeholder");
-            if (placeholder) pieces.push(placeholder);
-            const name = el.getAttribute("name");
-            if (name) pieces.push(name);
-            return pieces.join(" ").replace(/\\s+/g, " ").trim();
-          };
-
-          const matchAnswer = (text) => {
-            const t = normalize(text);
-            let best = null;
-            let bestScore = -1;
-            for (const [needleRaw, answer] of mappings) {
-              const needleStr = String(needleRaw || "").trim();
-              const needle = normalize(needleStr);
-              if (!needle) continue;
-
-              if (needle.startsWith("re:")) {
-                const pattern = needleStr.slice(3).trim();
-                if (!pattern) continue;
-                try {
-                  const re = new RegExp(pattern, "i");
-                  if (re.test(text || "")) {
-                    const ans = String(answer || "");
-                    const score = 10000 + pattern.length;
-                    if (score > bestScore) {
-                      best = isHuman(ans) ? null : ans;
-                      bestScore = score;
-                    }
-                  }
-                } catch (e) {
-                  continue;
-                }
-                continue;
-              }
-
-              if (t.includes(needle)) {
-                const score = needle.length;
-                if (score <= bestScore) continue;
-                const ans = String(answer || "");
-                best = isHuman(ans) ? null : ans;
-                bestScore = score;
-              }
-            }
-            return best;
-          };
-
-          const setValue = (control, answer) => {
-            const tag = (control.tagName || "").toLowerCase();
-            const type = (control.type || "").toLowerCase();
-            const ansNorm = normalize(answer);
-
-            if (tag === "select") {
-              const options = Array.from(control.options || []);
-              // Prefer exact-ish match, then substring.
-              const exact = options.find((o) => normalize(o.textContent) === ansNorm || normalize(o.value) === ansNorm);
-              const partial = options.find((o) => normalize(o.textContent).includes(ansNorm) || normalize(o.value).includes(ansNorm));
-              let match = exact || partial;
-              // Fallback for yes/no semantics when options are longer phrases.
-              if (!match && (ansNorm === "yes" || ansNorm === "no")) {
-                match = options.find((o) => {
-                  const t = normalize(o.textContent) + " " + normalize(o.value);
-                  if (ansNorm === "yes") {
-                    return t.includes("yes") || t.includes("authorized") || t.includes("eligible") || t.includes("i am");
-                  }
-                  return t.includes("no") || t.includes("not") || t.includes("do not") || t.includes("require");
-                });
-              }
-              if (match) {
-                control.value = match.value;
-                control.dispatchEvent(new Event("input", { bubbles: true }));
-                control.dispatchEvent(new Event("change", { bubbles: true }));
-                return true;
-              }
-              return false;
-            }
-
-            if (type === "radio") {
-              const name = control.name || "";
-              if (!name) return false;
-              const radios = Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`));
-              let want = ansNorm;
-              if (want === "true") want = "yes";
-              if (want === "false") want = "no";
-              const target = radios.find((r) => {
-                const t = normalize(r.closest("label")?.innerText || "") + " " + normalize(r.value || "");
-                return t.includes(want);
-              });
-              if (target) {
-                try { target.checked = true; } catch (e) {}
-                target.dispatchEvent(new Event("input", { bubbles: true }));
-                target.dispatchEvent(new Event("change", { bubbles: true }));
-                return true;
-              }
-              // Common yes/no radio cases.
-              if (want.startsWith("yes") || want.startsWith("no")) {
-                const yn = radios.find((r) => {
-                  const t = normalize(r.closest("label")?.innerText || "") + " " + normalize(r.value || "");
-                  return want.startsWith("yes") ? t.includes("yes") : t.includes("no");
-                });
-                if (yn) {
-                  try { yn.checked = true; } catch (e) {}
-                  yn.dispatchEvent(new Event("input", { bubbles: true }));
-                  yn.dispatchEvent(new Event("change", { bubbles: true }));
-                  return true;
-                }
-              }
-              return false;
-            }
-
-            if (type === "checkbox") {
-              const truthy = new Set(["yes", "true", "y", "1", "on", "checked"]);
-              if (truthy.has(ansNorm) && !control.checked) {
-                try { control.checked = true; } catch (e) {}
-                control.dispatchEvent(new Event("input", { bubbles: true }));
-                control.dispatchEvent(new Event("change", { bubbles: true }));
-                return true;
-              }
-              return false;
-            }
-
-            const role = normalize(control.getAttribute ? control.getAttribute("role") : "");
-            if (role === "combobox" || normalize(control.className || "").includes("select__input")) {
-              // Many modern dropdowns require trusted user events. Leave these to Playwright-level interactions.
-              return false;
-            }
-
-            if ("value" in control) {
-              const existing = (control.value || "").trim();
-              if (existing) return false;
-              safeFocus(control);
-              setNativeValue(control, answer);
-              control.dispatchEvent(new Event("input", { bubbles: true }));
-              control.dispatchEvent(new Event("change", { bubbles: true }));
-              return true;
-            }
-            return false;
-          };
-
-          let filled = 0;
-          const seen = new Set();
-
-          const controls = Array.from(document.querySelectorAll("input,textarea,select"));
-          for (const el of controls) {
-            if (el.disabled || el.readOnly) continue;
-            if (isHidden(el)) continue;
-            const tag = (el.tagName || "").toLowerCase();
-            const type = normalize(el.type || "");
-            if (type === "hidden" || type === "submit" || type === "button" || type === "reset") continue;
-            if (type === "file") continue;
-            if (seen.has(el)) continue;
-
-            const labelText = labelTextFor(el);
-            if (!labelText) continue;
-            const answer = matchAnswer(labelText);
-            if (!answer) continue;
-
-            if (type === "radio") {
-              // Only act on first radio in a group.
-              const name = el.name || "";
-              if (name && document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`).length > 1) {
-                const first = document.querySelector(`input[type="radio"][name="${CSS.escape(name)}"]`);
-                if (first && first !== el) continue;
-              }
-            }
-
-            if (setValue(el, answer)) {
-              seen.add(el);
-              filled += 1;
-            }
-          }
-
-          return filled;
-        }
-        """
-        try:
-            result = await maybe_await(evaluate_fn(script, mappings))
-            filled = result if isinstance(result, int) else 0
-            logger.info("  Standard questions JS pass filled: %d fields", filled)
-        except Exception:
-            logger.debug("  Standard questions JS pass failed.", exc_info=True)
-            filled = 0
-
-        # Some modern UIs (ex: react-select comboboxes) require trusted user events to select an option.
-        # Do a second pass with Playwright-level interactions when available.
-        try:
-            logger.debug("  Standard questions: checkboxes & radios pass...")
-            cr_count = await self._fill_standard_questions_checkboxes_and_radios(page, mappings)
-            filled += cr_count
-            if cr_count:
-                logger.info("  Standard questions checkboxes/radios filled: %d", cr_count)
-        except Exception:
-            logger.debug("  Standard questions checkboxes/radios pass failed.", exc_info=True)
-        try:
-            logger.debug("  Standard questions: comboboxes pass...")
-            cb_count = await self._fill_standard_questions_comboboxes(page, mappings)
-            filled += cb_count
-            if cb_count:
-                logger.info("  Standard questions comboboxes filled: %d", cb_count)
-        except Exception:
-            logger.debug("  Standard questions comboboxes pass failed.", exc_info=True)
-        try:
-            logger.debug("  Standard questions: text inputs Playwright pass...")
-            ti_count = await self._fill_standard_questions_text_inputs_playwright(page, mappings)
-            filled += ti_count
-            if ti_count:
-                logger.info("  Standard questions text inputs filled: %d", ti_count)
-        except Exception:
-            logger.debug("  Standard questions text inputs Playwright pass failed.", exc_info=True)
-        return filled
-
-    async def _fill_standard_questions_checkboxes_and_radios(
-        self, page: Any, mappings: list[tuple[str, str]]
-    ) -> int:
-        """
-        Scan-first approach for checkbox/radio controls using trusted Playwright events.
-
-        1. Single JS call extracts all visible checkboxes + radio groups with labels/options/selectors.
-        2. Python-side matching against the answer bank (instant).
-        3. Playwright interactions only for confirmed matches.
-        """
-        evaluate_fn = getattr(page, "evaluate", None)
-        locator_fn = getattr(page, "locator", None)
-        get_by_role_fn = getattr(page, "get_by_role", None)
-        if evaluate_fn is None or (locator_fn is None and get_by_role_fn is None):
-            return 0
-
-        # --- Step 1: Scan the DOM for all visible checkboxes and radio groups ---
-        scan_script = """
-        () => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-          const cssEscape = (v) => {
-            try { return (window.CSS && CSS.escape) ? CSS.escape(String(v || "")) : String(v || ""); }
-            catch (e) { return String(v || ""); }
-          };
-
-          const isHidden = (el) => {
-            if (!el) return true;
-            try {
-              const rect = el.getBoundingClientRect();
-              if (!rect || rect.width < 2 || rect.height < 2) return true;
-            } catch (e) { return true; }
-            let cur = el;
-            for (let i = 0; i < 5 && cur; i += 1) {
-              try {
-                const ariaHidden = normalize(cur.getAttribute ? (cur.getAttribute("aria-hidden") || "") : "");
-                if (ariaHidden === "true") return true;
-                const style = window.getComputedStyle(cur);
-                if (style.display === "none" || style.visibility === "hidden") return true;
-                const opacity = parseFloat(style.opacity || "1");
-                if (!Number.isNaN(opacity) && opacity < 0.05) return true;
-              } catch (e) {}
-              cur = cur.parentElement;
-            }
-            return false;
-          };
-
-          const labelTextFor = (el) => {
-            const pieces = [];
-            const aria = el.getAttribute("aria-label");
-            if (aria) pieces.push(aria);
-            const labelledBy = el.getAttribute("aria-labelledby");
-            if (labelledBy) {
-              for (const id of labelledBy.split(/\\s+/)) {
-                const n = document.getElementById(id);
-                if (n?.innerText) pieces.push(n.innerText);
-              }
-            }
-            if (el.id) {
-              const byFor = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
-              if (byFor?.innerText) pieces.push(byFor.innerText);
-            }
-            const wrap = el.closest("label");
-            if (wrap?.innerText) pieces.push(wrap.innerText);
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            for (let i = 0; i < 3 && root; i += 1) {
-              const legend = root.querySelector("legend");
-              if (legend?.innerText) pieces.push(legend.innerText);
-              const labelLike = root.querySelector("label,h3,h4,p,strong,span,div");
-              if (labelLike?.innerText) pieces.push(labelLike.innerText);
-              root = root.parentElement;
-            }
-            const placeholder = el.getAttribute("placeholder");
-            if (placeholder) pieces.push(placeholder);
-            const name = el.getAttribute("name");
-            if (name) pieces.push(name);
-            return pieces.join(" ").replace(/\\s+/g, " ").trim();
-          };
-
-          const selectorFor = (el) => {
-            if (!el) return "";
-            if (el.id) return "#" + cssEscape(el.id);
-            const name = el.getAttribute("name");
-            if (name) return `${el.tagName.toLowerCase()}[name="${cssEscape(name)}"]`;
-            const parts = [];
-            let cur = el;
-            for (let i = 0; i < 5 && cur && cur.nodeType === 1; i += 1) {
-              const tag = cur.tagName.toLowerCase();
-              let index = 1;
-              let sib = cur.previousElementSibling;
-              while (sib) {
-                if (sib.tagName === cur.tagName) index += 1;
-                sib = sib.previousElementSibling;
-              }
-              parts.unshift(`${tag}:nth-of-type(${index})`);
-              cur = cur.parentElement;
-            }
-            return parts.join(" > ");
-          };
-
-          const result = { checkboxes: [], radioGroups: [] };
-
-          // --- Checkboxes ---
-          const checkboxes = document.querySelectorAll("input[type='checkbox']");
-          for (const cb of checkboxes) {
-            if (cb.disabled || cb.checked) continue;
-            if (isHidden(cb)) continue;
-            const label = labelTextFor(cb);
-            if (!label) continue;
-            const sel = selectorFor(cb);
-            if (!sel) continue;
-            result.checkboxes.push({ label, selector: sel });
-          }
-
-          // --- Radio groups ---
-          // Collect unique groups by name attribute.
-          const radiosByName = {};
-          const radios = document.querySelectorAll("input[type='radio']");
-          for (const r of radios) {
-            if (r.disabled) continue;
-            if (isHidden(r)) continue;
-            const name = r.getAttribute("name") || "";
-            if (!name) continue;
-            if (!radiosByName[name]) radiosByName[name] = [];
-            const optLabel = labelTextFor(r);
-            radiosByName[name].push({
-              optionLabel: optLabel || r.value || "",
-              optionValue: r.value || "",
-              selector: selectorFor(r),
-              checked: r.checked
-            });
-          }
-          for (const [name, options] of Object.entries(radiosByName)) {
-            // Skip groups where a choice is already selected.
-            if (options.some(o => o.checked)) continue;
-            // Determine the group label from the first radio's context.
-            const firstRadio = document.querySelector(`input[type='radio'][name="${cssEscape(name)}"]`);
-            let groupLabel = "";
-            if (firstRadio) {
-              // Look for fieldset > legend, or ARIA group label, or nearest heading.
-              const fieldset = firstRadio.closest("fieldset");
-              if (fieldset) {
-                const legend = fieldset.querySelector("legend");
-                if (legend?.innerText) groupLabel = legend.innerText;
-              }
-              if (!groupLabel) {
-                const group = firstRadio.closest("[role='radiogroup'],[role='group']");
-                if (group) {
-                  const aria = group.getAttribute("aria-label") || "";
-                  const ariaBy = group.getAttribute("aria-labelledby") || "";
-                  if (aria) groupLabel = aria;
-                  else if (ariaBy) {
-                    const el = document.getElementById(ariaBy);
-                    if (el?.innerText) groupLabel = el.innerText;
-                  }
-                }
-              }
-              if (!groupLabel) {
-                // Walk up to find nearest label-like text
-                let parent = firstRadio.parentElement;
-                for (let i = 0; i < 5 && parent; i++) {
-                  const heading = parent.querySelector("label,h3,h4,p.question,legend,strong");
-                  if (heading?.innerText && heading.innerText.length > 3) {
-                    groupLabel = heading.innerText;
-                    break;
-                  }
-                  parent = parent.parentElement;
-                }
-              }
-            }
-            if (!groupLabel) continue;
-            result.radioGroups.push({
-              groupLabel: groupLabel.replace(/\\s+/g, " ").trim(),
-              name,
-              options: options.map(o => ({
-                label: o.optionLabel,
-                value: o.optionValue,
-                selector: o.selector
-              }))
-            });
-          }
-
-          // Also detect ARIA radiogroups (some modern UIs don't use <input type=radio>).
-          const ariaGroups = document.querySelectorAll("[role='radiogroup']");
-          const seenGroupLabels = new Set(result.radioGroups.map(g => normalize(g.groupLabel)));
-          for (const group of ariaGroups) {
-            if (isHidden(group)) continue;
-            const aria = group.getAttribute("aria-label") || "";
-            const ariaBy = group.getAttribute("aria-labelledby") || "";
-            let groupLabel = aria;
-            if (!groupLabel && ariaBy) {
-              const el = document.getElementById(ariaBy);
-              if (el?.innerText) groupLabel = el.innerText;
-            }
-            if (!groupLabel) continue;
-            groupLabel = groupLabel.replace(/\\s+/g, " ").trim();
-            if (seenGroupLabels.has(normalize(groupLabel))) continue;
-            const roleRadios = group.querySelectorAll("[role='radio']");
-            if (!roleRadios.length) continue;
-            const alreadySelected = Array.from(roleRadios).some(r =>
-              r.getAttribute("aria-checked") === "true"
-            );
-            if (alreadySelected) continue;
-            const options = [];
-            for (const r of roleRadios) {
-              if (isHidden(r)) continue;
-              const optLabel = r.getAttribute("aria-label") || r.innerText || "";
-              options.push({
-                label: optLabel.replace(/\\s+/g, " ").trim(),
-                value: r.getAttribute("data-value") || optLabel.replace(/\\s+/g, " ").trim(),
-                selector: selectorFor(r)
-              });
-            }
-            if (options.length > 0) {
-              result.radioGroups.push({ groupLabel, name: "", options });
-            }
-          }
-
-          return result;
-        }
-        """
-
-        try:
-            scanned = await maybe_await(evaluate_fn(scan_script))
-        except Exception:
-            logger.debug("    checkbox/radio DOM scan failed.", exc_info=True)
-            return 0
-
-        if not isinstance(scanned, dict):
-            return 0
-
-        checkboxes = scanned.get("checkboxes") or []
-        radio_groups = scanned.get("radioGroups") or []
-        logger.info("    DOM scan found %d checkbox(es), %d radio group(s).",
-                     len(checkboxes), len(radio_groups))
-
-        if not checkboxes and not radio_groups:
-            return 0
-
-        # --- Step 2: Match extracted controls against answer bank (pure Python, instant) ---
-        from openclaw.answer_bank import match_question_bank
-
-        truthy = {"yes", "true", "y", "1", "on", "checked", "i agree", "i acknowledge",
-                  "i acknowledge and agree", "i consent"}
-        count = 0
-
-        # Process checkboxes: match label, check if answer is truthy.
-        for cb in checkboxes:
-            label = str(cb.get("label") or "").strip()
-            selector = str(cb.get("selector") or "").strip()
-            if not label or not selector:
-                continue
-            logger.debug("    checkbox label: '%s' (selector: %s)", label[:80], selector[:40])
-            matched = match_question_bank(label, mappings)
-            if matched is None:
-                logger.debug("    checkbox NO MATCH for: '%s'", label[:80])
-                continue
-            ans_norm = str(matched).strip().lower()
-            if is_human_sentinel(str(matched)):
-                logger.debug("    checkbox HUMAN sentinel: '%s' -> %s", label[:50], matched)
-                continue
-            if ans_norm not in truthy:
-                logger.debug("    checkbox SKIP (not truthy): '%s' -> '%s'", label[:50], ans_norm)
-                continue
-            logger.debug("    checkbox MATCH: %s -> %s", label[:50], matched)
-            try:
-                loc = locator_fn(selector) if locator_fn else None
-                if loc is not None:
-                    check_fn = getattr(loc.first, "check", None)
-                    if check_fn:
-                        await maybe_await(check_fn(timeout=1500))
-                        count += 1
-                        continue
-                # Fallback: click
-                if loc is not None:
-                    await maybe_await(loc.first.click(timeout=1500))
-                    count += 1
-            except Exception:
-                logger.debug("    checkbox fill failed: %s", label[:50], exc_info=True)
-
-        # Process radio groups: match group label, then find best option.
-        for rg in radio_groups:
-            group_label = str(rg.get("groupLabel") or "").strip()
-            options = rg.get("options") or []
-            if not group_label or not options:
-                continue
-            matched = match_question_bank(group_label, mappings)
-            if matched is None:
-                continue
-            if is_human_sentinel(str(matched)):
-                continue
-            answer = str(matched).strip()
-            answer_norm = answer.lower().replace("/", " ").strip()
-
-            # Find the best matching option.
-            best_opt = None
-            best_score = -1
-            for opt in options:
-                opt_label = str(opt.get("label") or opt.get("value") or "").strip()
-                opt_norm = opt_label.lower().replace("/", " ").strip()
-                # Exact match.
-                if opt_norm == answer_norm:
-                    best_opt = opt
-                    best_score = 10000
-                    break
-                # Containment match.
-                if answer_norm in opt_norm or opt_norm in answer_norm:
-                    score = len(answer_norm)
-                    if score > best_score:
-                        best_opt = opt
-                        best_score = score
-                # Yes/No semantic match.
-                if answer_norm in {"yes", "true", "y"} and opt_norm in {"yes", "true", "y"}:
-                    best_opt = opt
-                    best_score = 5000
-                if answer_norm in {"no", "false", "n"} and opt_norm in {"no", "false", "n"}:
-                    best_opt = opt
-                    best_score = 5000
-
-            if best_opt is None:
-                logger.debug("    radio MATCH but no option: group=%s, answer=%s, options=%s",
-                             group_label[:40], answer[:30],
-                             [o.get("label", "")[:20] for o in options[:4]])
-                continue
-
-            opt_sel = str(best_opt.get("selector") or "").strip()
-            logger.debug("    radio MATCH: %s -> %s (option: %s)",
-                         group_label[:40], answer[:30],
-                         str(best_opt.get("label") or "")[:30])
-            try:
-                if opt_sel and locator_fn:
-                    loc = locator_fn(opt_sel).first
-                    check_fn = getattr(loc, "check", None)
-                    if check_fn:
-                        await maybe_await(check_fn(timeout=1500))
-                    else:
-                        await maybe_await(loc.click(timeout=1500))
-                    count += 1
-                    continue
-                # Fallback: use get_by_role if available.
-                if get_by_role_fn is not None:
-                    try:
-                        needle_re = re.compile(re.escape(group_label[:60]), re.I)
-                        group_loc = get_by_role_fn("radiogroup", name=needle_re).first
-                        ans_re = re.compile(re.escape(str(best_opt.get("label") or answer)[:60]), re.I)
-                        opt_loc = group_loc.get_by_role("radio", name=ans_re).first
-                        check_fn = getattr(opt_loc, "check", None)
-                        if check_fn:
-                            await maybe_await(check_fn(timeout=1500))
-                        else:
-                            await maybe_await(opt_loc.click(timeout=1500))
-                        count += 1
-                    except Exception:
-                        pass
-            except Exception:
-                logger.debug("    radio fill failed: %s", group_label[:40], exc_info=True)
-
-        return count
-
-    async def _fill_standard_questions_text_inputs_playwright(
-        self, page: Any, mappings: list[tuple[str, str]]
-    ) -> int:
-        """
-        Second pass for text inputs using Playwright `.fill()` (trusted user events).
-        """
-        locator_fn = getattr(page, "locator", None)
-        evaluate_fn = getattr(page, "evaluate", None)
-        if locator_fn is None or evaluate_fn is None:
-            return 0
-
-        def _needle_for_scan(raw: str) -> str:
-            n = str(raw or "").strip()
-            if not n:
-                return ""
-            lower = n.lower()
-            if lower.startswith("re:"):
-                candidate = n[3:]
-                candidate = re.sub(r"\\s\\+|\\s\\*|\\s\\?|\\s", " ", candidate)
-                candidate = re.sub(r"[^a-zA-Z0-9 ]+", " ", candidate)
-                return normalize_text(candidate)
-            return normalize_text(n)
-
-        needles: list[str] = []
-        seen_needles: set[str] = set()
-        for needle, _answer in mappings:
-            scan = _needle_for_scan(str(needle))
-            if not scan or scan in seen_needles:
-                continue
-            needles.append(scan)
-            seen_needles.add(scan)
-
-        if not needles:
-            return 0
-
-        scan_script = """
-        (needles) => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-          const cssEscape = (v) => {
-            try { return (window.CSS && CSS.escape) ? CSS.escape(String(v || "")) : String(v || ""); } catch (e) { return String(v || ""); }
-          };
-
-          const isHidden = (el) => {
-            if (!el) return true;
-            try {
-              const rect = el.getBoundingClientRect();
-              if (!rect || rect.width < 2 || rect.height < 2) return true;
-            } catch (e) {
-              return true;
-            }
-            let cur = el;
-            for (let i = 0; i < 5 && cur; i += 1) {
-              try {
-                const ariaHidden = normalize(cur.getAttribute ? (cur.getAttribute("aria-hidden") || "") : "");
-                if (ariaHidden === "true") return true;
-                const style = window.getComputedStyle(cur);
-                if (style.display === "none" || style.visibility === "hidden") return true;
-                const opacity = parseFloat(style.opacity || "1");
-                if (!Number.isNaN(opacity) && opacity < 0.05) return true;
-              } catch (e) {}
-              cur = cur.parentElement;
-            }
-            return false;
-          };
-
-          const yFor = (el) => {
-            try {
-              const r = el.getBoundingClientRect();
-              return (r.top || 0) + window.scrollY;
-            } catch (e) {
-              return 0;
-            }
-          };
-
-          const labelTextFor = (el) => {
-            const pieces = [];
-            const aria = el.getAttribute("aria-label");
-            if (aria) pieces.push(aria);
-            const labelledBy = el.getAttribute("aria-labelledby");
-            if (labelledBy) {
-              for (const id of labelledBy.split(/\\s+/)) {
-                const n = document.getElementById(id);
-                if (n?.innerText) pieces.push(n.innerText);
-              }
-            }
-            if (el.id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-              if (byFor?.innerText) pieces.push(byFor.innerText);
-            }
-            const wrap = el.closest("label");
-            if (wrap?.innerText) pieces.push(wrap.innerText);
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            for (let i = 0; i < 2 && root; i += 1) {
-              const legend = root.querySelector("legend");
-              if (legend?.innerText) pieces.push(legend.innerText);
-              const labelLike = root.querySelector("label,h3,h4,p,strong,span,div");
-              if (labelLike?.innerText) pieces.push(labelLike.innerText);
-              root = root.parentElement;
-            }
-            const placeholder = el.getAttribute("placeholder");
-            if (placeholder) pieces.push(placeholder);
-            const name = el.getAttribute("name");
-            if (name) pieces.push(name);
-            return pieces.join(" ").replace(/\\s+/g, " ").trim();
-          };
-
-          const selectorFor = (el) => {
-            if (!el) return "";
-            const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(String(v || "")) : String(v || "");
-            if (el.id) return "#" + esc(el.id);
-            const automationId = el.getAttribute("data-automation-id");
-            if (automationId) return `${el.tagName.toLowerCase()}[data-automation-id="${esc(automationId)}"]`;
-            const name = el.getAttribute("name");
-            if (name) return `${el.tagName.toLowerCase()}[name="${esc(name)}"]`;
-            const parts = [];
-            let cur = el;
-            for (let i = 0; i < 5 && cur && cur.nodeType === 1; i += 1) {
-              const tag = cur.tagName.toLowerCase();
-              let index = 1;
-              let sib = cur.previousElementSibling;
-              while (sib) {
-                if (sib.tagName === cur.tagName) index += 1;
-                sib = sib.previousElementSibling;
-              }
-              parts.unshift(`${tag}:nth-of-type(${index})`);
-              cur = cur.parentElement;
-            }
-            return parts.join(" > ");
-          };
-
-          const matchesAny = (label) => {
-            const t = normalize(label);
-            return needles.some((n) => n && t.includes(n));
-          };
-
-          const out = [];
-          const controls = Array.from(document.querySelectorAll("input,textarea"));
-          for (const el of controls) {
-            if (out.length >= 18) break;
-            if (el.disabled || el.readOnly) continue;
-            if (isHidden(el)) continue;
-
-            const tag = (el.tagName || "").toLowerCase();
-            const type = normalize(el.type || "");
-            if (type === "hidden" || type === "password" || type === "submit" || type === "button" || type === "reset") continue;
-            if (type === "file" || type === "checkbox" || type === "radio") continue;
-            if ((el.value || "").trim()) continue;
-
-            const label = labelTextFor(el);
-            if (!label) continue;
-            if (!matchesAny(label)) continue;
-            const sel = selectorFor(el);
-            if (!sel) continue;
-            out.push({ selector: sel, label, tag, type, y: yFor(el) });
-          }
-          out.sort((a, b) => (a.y || 0) - (b.y || 0));
-          return out.slice(0, 12);
-        }
-        """
-
-        try:
-            scanned = await maybe_await(evaluate_fn(scan_script, needles))
-        except Exception:
-            return 0
-
-        if not isinstance(scanned, list) or not scanned:
-            return 0
-
-        candidates: list[dict[str, str]] = []
-        for item in scanned:
-            if not isinstance(item, dict):
-                continue
-            selector = str(item.get("selector") or "").strip()
-            label = str(item.get("label") or "").strip()
-            tag = str(item.get("tag") or "").strip()
-            typ = str(item.get("type") or "").strip()
-            if selector and label:
-                candidates.append({"selector": selector, "label": label, "tag": tag, "type": typ})
-
-        if not candidates:
-            return 0
-
-        count = 0
-        for item in candidates:
-            selector = item["selector"]
-            label_text = item["label"]
-
-            answer: str | None = None
-            best_score = -1
-            label_norm_text = normalize_text(label_text)
-            for needle, mapped in mappings:
-                needle_str = str(needle or "").strip()
-                if not needle_str:
-                    continue
-                if needle_str.lower().startswith("re:"):
-                    pattern = needle_str[3:].strip()
-                    if not pattern:
-                        continue
-                    try:
-                        if re.search(pattern, label_text, flags=re.I):
-                            score = 10_000 + len(pattern)
-                            if score > best_score:
-                                best_score = score
-                                answer = str(mapped)
-                    except re.error:
-                        continue
-                    continue
-
-                n = normalize_text(needle_str)
-                if n and n in label_norm_text:
-                    score = len(n)
-                    if score > best_score:
-                        best_score = score
-                        answer = str(mapped)
-            if not answer or is_human_sentinel(answer):
-                continue
-
-            loc = locator_fn(selector)
-            # Prefer visible matches to avoid hidden duplicates (common in modern form UIs).
-            visible = None
-            try:
-                max_scan = min(int(await maybe_await(loc.count())), 8)
-            except Exception:
-                max_scan = 1
-            for i in range(max_scan):
-                cand = loc.nth(i)
-                try:
-                    if await maybe_await(cand.is_visible()):
-                        visible = cand
-                        break
-                except Exception:
-                    continue
-            if visible is None:
-                visible = loc.first
-            try:
-                await maybe_await(visible.scroll_into_view_if_needed(timeout=2000))
-            except Exception:
-                pass
-            try:
-                await maybe_await(visible.fill(answer, timeout=2500))
-                count += 1
-                continue
-            except Exception:
-                pass
-
-            # Fallback: click + type for masked inputs.
-            try:
-                await maybe_await(visible.click(timeout=2000))
-                keyboard = getattr(page, "keyboard", None)
-                if keyboard is not None:
-                    type_fn = getattr(keyboard, "type", None)
-                    if type_fn:
-                        await maybe_await(type_fn(answer, delay=18))
-                        count += 1
-            except Exception:
-                continue
-
-        return count
-
-    async def _fill_standard_questions_comboboxes(
-        self, page: Any, mappings: list[tuple[str, str]]
-    ) -> int:
-        """
-        Fill react-select / combobox based standard questions using trusted browser events.
-
-        DOM-driven `.evaluate()` can fail here because many frameworks ignore synthetic/untrusted events.
-        """
-        locator_fn = getattr(page, "locator", None)
-        keyboard = getattr(page, "keyboard", None)
-        evaluate_fn = getattr(page, "evaluate", None)
-        if locator_fn is None or keyboard is None or evaluate_fn is None:
-            return 0
-
-        def _needle_for_scan(raw: str) -> str:
-            n = str(raw or "").strip()
-            if not n:
-                return ""
-            lower = n.lower()
-            if lower.startswith("re:"):
-                # Best-effort: strip regex noise so JS substring matching can still find the field.
-                candidate = n[3:]
-                candidate = re.sub(r"\\s\\+|\\s\\*|\\s\\?|\\s", " ", candidate)
-                candidate = re.sub(r"[^a-zA-Z0-9 ]+", " ", candidate)
-                return normalize_text(candidate)
-            return normalize_text(n)
-
-        needles: list[str] = []
-        seen_needles: set[str] = set()
-        for needle, _answer in mappings:
-            scan = _needle_for_scan(str(needle))
-            if not scan or scan in seen_needles:
-                continue
-            needles.append(scan)
-            seen_needles.add(scan)
-
-        if not needles:
-            return 0
-
-        scan_script = """
-        (needles) => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-
-          const isHidden = (el) => {
-            if (!el) return true;
-            try {
-              const rect = el.getBoundingClientRect();
-              if (!rect || rect.width < 2 || rect.height < 2) return true;
-            } catch (e) {
-              return true;
-            }
-            let cur = el;
-            for (let i = 0; i < 5 && cur; i += 1) {
-              try {
-                const ariaHidden = normalize(cur.getAttribute ? (cur.getAttribute("aria-hidden") || "") : "");
-                if (ariaHidden === "true") return true;
-                const style = window.getComputedStyle(cur);
-                if (style.display === "none" || style.visibility === "hidden") return true;
-                const opacity = parseFloat(style.opacity || "1");
-                if (!Number.isNaN(opacity) && opacity < 0.05) return true;
-              } catch (e) {}
-              cur = cur.parentElement;
-            }
-            return false;
-          };
-
-          const yFor = (el) => {
-            try {
-              const r = el.getBoundingClientRect();
-              return (r.top || 0) + window.scrollY;
-            } catch (e) {
-              return 0;
-            }
-          };
-
-          const labelTextFor = (el) => {
-            const parts = [];
-            const aria = el.getAttribute("aria-label");
-            if (aria) parts.push(aria);
-            const labelledBy = el.getAttribute("aria-labelledby");
-            if (labelledBy) {
-              for (const id of labelledBy.split(/\\s+/)) {
-                const n = document.getElementById(id);
-                if (n?.innerText) parts.push(n.innerText);
-              }
-            }
-            if (el.id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-              if (byFor?.innerText) parts.push(byFor.innerText);
-            }
-            const wrap = el.closest("label");
-            if (wrap?.innerText) parts.push(wrap.innerText);
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            for (let i = 0; i < 2 && root; i += 1) {
-              const legend = root.querySelector("legend");
-              if (legend?.innerText) parts.push(legend.innerText);
-              const labelLike = root.querySelector("label,h3,h4,p,strong,span,div");
-              if (labelLike?.innerText) parts.push(labelLike.innerText);
-              root = root.parentElement;
-            }
-            const placeholder = el.getAttribute("placeholder");
-            if (placeholder) parts.push(placeholder);
-            const name = el.getAttribute("name");
-            if (name) parts.push(name);
-            return parts.join(" ").replace(/\\s+/g, " ").trim();
-          };
-
-          const selectorFor = (el) => {
-            if (!el) return "";
-            const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(String(v || "")) : String(v || "");
-            if (el.id) return "#" + esc(el.id);
-            const automationId = el.getAttribute("data-automation-id");
-            if (automationId) return `${el.tagName.toLowerCase()}[data-automation-id="${esc(automationId)}"]`;
-            const name = el.getAttribute("name");
-            if (name) return `${el.tagName.toLowerCase()}[name="${esc(name)}"]`;
-            // Fallback: short-ish nth-of-type path.
-            const parts = [];
-            let cur = el;
-            for (let i = 0; i < 5 && cur && cur.nodeType === 1; i += 1) {
-              const tag = cur.tagName.toLowerCase();
-              let index = 1;
-              let sib = cur.previousElementSibling;
-              while (sib) {
-                if (sib.tagName === cur.tagName) index += 1;
-                sib = sib.previousElementSibling;
-              }
-              parts.unshift(`${tag}:nth-of-type(${index})`);
-              cur = cur.parentElement;
-            }
-            return parts.join(" > ");
-          };
-
-          const openSelectorFor = (el) => {
-            if (!el) return "";
-            const container =
-              el.closest(".select__control, [aria-haspopup='listbox'], [role='combobox'], fieldset, section, div, li, td, dd, form") ||
-              el.parentElement;
-            if (container) {
-              const cand = container.querySelector(
-                "button[aria-haspopup='listbox'], [role='button'][aria-haspopup='listbox'], button[aria-label*='open'], button[aria-label*='expand'], button[aria-label*='dropdown'], .select__dropdown-indicator, .select__indicator"
-              );
-              if (cand && !isHidden(cand)) {
-                const sel = selectorFor(cand);
-                if (sel) return sel;
-              }
-            }
-            return selectorFor(el);
-          };
-
-          const hasSelectedValue = (el) => {
-            try {
-              const ariaVal = el.getAttribute("aria-valuetext") || el.getAttribute("aria-value") || "";
-              const t = normalize(ariaVal);
-              if (t && !t.includes("select") && !t.includes("choose") && !t.includes("pick")) return true;
-            } catch (e) {}
-
-            try {
-              const tag = (el.tagName || "").toLowerCase();
-              if (tag === "input") {
-                const v = normalize(el.value || "");
-                if (v && !v.includes("select") && !v.includes("choose") && !v.includes("pick")) return true;
-              }
-            } catch (e) {}
-
-            // react-select style selected value container.
-            const control = el.closest(".select__control") || el.parentElement;
-            if (control) {
-              const node = control.querySelector(".select__single-value") || control.querySelector(".select__multi-value");
-              const t = normalize(node?.innerText || node?.textContent || "");
-              if (t && !t.includes("select") && !t.includes("choose") && !t.includes("pick")) return true;
-            }
-            return false;
-          };
-
-          const matchesAny = (label) => {
-            const t = normalize(label);
-            return needles.some((n) => n && t.includes(n));
-          };
-
-          const out = [];
-          const combos = Array.from(
-            document.querySelectorAll("[role='combobox'], button[aria-haspopup='listbox'], [aria-haspopup='listbox']")
-          );
-          for (const el of combos) {
-            if (out.length >= 16) break;
-            if (el.disabled || el.readOnly) continue;
-            if (isHidden(el)) continue;
-            // Avoid non-interactive containers.
-            const tag = (el.tagName || "").toLowerCase();
-            const tabindex = Number(el.getAttribute("tabindex") || "0");
-            if (tag !== "input" && tag !== "button" && tabindex < 0) continue;
-            const label = labelTextFor(el);
-            if (!label) continue;
-            if (!matchesAny(label)) continue;
-            if (hasSelectedValue(el)) continue;
-            const sel = selectorFor(el);
-            if (!sel) continue;
-            const openSel = openSelectorFor(el) || sel;
-            // react-select exposes the listbox id via aria-controls (best) or aria-describedby placeholder.
-            const ariaControls = el.getAttribute("aria-controls") || "";
-            const describedBy = el.getAttribute("aria-describedby") || "";
-            let listboxId = ariaControls;
-            if (!listboxId) {
-              const m = describedBy.match(/(react-select-[^\\s]+?)-placeholder/);
-              if (m && m[1]) listboxId = `${m[1]}-listbox`;
-            }
-            out.push({ selector: sel, open_selector: openSel, listbox_id: listboxId, id: el.id || "", label, tag, y: yFor(el) });
-          }
-          out.sort((a, b) => (a.y || 0) - (b.y || 0));
-          return out.slice(0, 12);
-        }
-        """
-
-        try:
-            scanned = await maybe_await(evaluate_fn(scan_script, needles))
-        except Exception:
-            return 0
-
-        if not isinstance(scanned, list) or not scanned:
-            return 0
-
-        candidates: list[dict[str, str]] = []
-        for item in scanned:
-            if not isinstance(item, dict):
-                continue
-            selector = str(item.get("selector") or "").strip()
-            open_selector = str(item.get("open_selector") or "").strip()
-            listbox_id = str(item.get("listbox_id") or "").strip()
-            cid = str(item.get("id") or "").strip()
-            label = str(item.get("label") or "").strip()
-            tag = str(item.get("tag") or "").strip()
-            if selector and label:
-                candidates.append(
-                    {
-                        "selector": selector,
-                        "open_selector": open_selector,
-                        "listbox_id": listbox_id,
-                        "id": cid,
-                        "label": label,
-                        "tag": tag,
-                    }
-                )
-
-        if not candidates:
-            return 0
-
-        count = 0
-        for item in candidates:
-            selector = item["selector"]
-            open_selector = item.get("open_selector") or ""
-            listbox_id = item.get("listbox_id") or ""
-            cid = item["id"]
-
-            label_text = item["label"]
-            answer: str | None = None
-            best_score = -1
-            label_norm_text = normalize_text(label_text)
-            for needle, mapped in mappings:
-                needle_str = str(needle or "").strip()
-                if not needle_str:
-                    continue
-                if needle_str.lower().startswith("re:"):
-                    pattern = needle_str[3:].strip()
-                    if not pattern:
-                        continue
-                    try:
-                        if re.search(pattern, label_text, flags=re.I):
-                            score = 10_000 + len(pattern)
-                            if score > best_score:
-                                best_score = score
-                                answer = str(mapped)
-                    except re.error:
-                        continue
-                    continue
-
-                n = normalize_text(needle_str)
-                if n and n in label_norm_text:
-                    score = len(n)
-                    if score > best_score:
-                        best_score = score
-                        answer = str(mapped)
-            if not answer:
-                continue
-            if is_human_sentinel(answer):
-                continue
-
-            # Many UIs require clicking an explicit dropdown icon/button (not the input itself).
-            opener = open_selector or selector
-            try:
-                loc = locator_fn(opener)
-                # Prefer the first visible match to avoid hidden duplicates.
-                chosen = None
-                try:
-                    max_scan = min(int(await maybe_await(loc.count())), 8)
-                except Exception:
-                    max_scan = 1
-                for i in range(max_scan):
-                    cand = loc.nth(i)
-                    try:
-                        if await maybe_await(cand.is_visible()):
-                            chosen = cand
-                            break
-                    except Exception:
-                        continue
-                if chosen is None:
-                    chosen = loc.first
-                try:
-                    await maybe_await(chosen.scroll_into_view_if_needed(timeout=2000))
-                except Exception:
-                    pass
-                await maybe_await(chosen.click(timeout=2500))
-            except Exception:
-                continue
-
-            # react-select reliably opens on ArrowDown with trusted events.
-            press_fn = getattr(keyboard, "press", None)
-            if press_fn:
-                try:
-                    await maybe_await(press_fn("ArrowDown"))
-                except Exception:
-                    pass
-
-            # Type to filter when supported (react-select / workday prompts often require this).
-            type_fn = getattr(keyboard, "type", None)
-            if type_fn and answer and len(str(answer)) <= 120:
-                try:
-                    # Ensure the actual combobox/input is focused.
-                    if opener != selector:
-                        try:
-                            await maybe_await(locator_fn(selector).first.click(timeout=1500))
-                        except Exception:
-                            pass
-                    try:
-                        await maybe_await(press_fn("Control+A"))
-                    except Exception:
-                        pass
-                    try:
-                        await maybe_await(press_fn("Meta+A"))
-                    except Exception:
-                        pass
-                    try:
-                        await maybe_await(press_fn("Backspace"))
-                    except Exception:
-                        pass
-                    await maybe_await(type_fn(str(answer), delay=16))
-                except Exception:
-                    pass
-
-            clicked = False
-            try:
-                # Prefer a specific listbox when we can derive it; otherwise fall back to any visible listbox.
-                options_loc = None
-
-                if listbox_id:
-                    try:
-                        listbox_sel = f"#{listbox_id}"
-                        listbox = locator_fn(listbox_sel)
-                        await maybe_await(listbox.wait_for(state="visible", timeout=1500))
-                        options_loc = locator_fn(f"{listbox_sel} [role=option]")
-                    except Exception:
-                        options_loc = None
-
-                # Legacy react-select guess (only works for some DOMs). If it fails, continue to generic fallback.
-                if options_loc is None and cid:
-                    try:
-                        listbox_sel = f"#react-select-{cid}-listbox"
-                        listbox = locator_fn(listbox_sel)
-                        await maybe_await(listbox.wait_for(state="visible", timeout=800))
-                        options_loc = locator_fn(f"{listbox_sel} [role=option]")
-                    except Exception:
-                        options_loc = None
-
-                if options_loc is None:
-                    try:
-                        await maybe_await(
-                            locator_fn("[role=listbox]").first.wait_for(state="visible", timeout=1500)
-                        )
-                    except Exception:
-                        pass
-                    options_loc = locator_fn("[role=listbox] [role=option]")
-
-                option_count = await maybe_await(options_loc.count())
-                if not option_count or option_count <= 0:
-                    # Workday-style options.
-                    options_loc = locator_fn("[data-automation-id='promptOption']")
-                    option_count = await maybe_await(options_loc.count())
-                if not option_count or option_count <= 0:
-                    options_loc = locator_fn(".select__menu [role=option], .select__menu .select__option")
-                    option_count = await maybe_await(options_loc.count())
-
-                if option_count and option_count > 0:
-                    try:
-                        texts = await maybe_await(options_loc.all_inner_texts())
-                    except Exception:
-                        texts = []
-                        max_scan = min(int(option_count), 50)
-                        for i in range(max_scan):
-                            try:
-                                t = await maybe_await(options_loc.nth(i).inner_text())
-                            except Exception:
-                                t = ""
-                            texts.append(str(t or ""))
-
-                    ans_norm = normalize_text(answer)
-                    tokens = [t for t in ans_norm.split(" ") if len(t) >= 3]
-
-                    best_idx = -1
-                    best_opt_score = 0
-                    for i, txt in enumerate(texts[:80]):
-                        opt_norm = normalize_text(txt)
-                        if not opt_norm:
-                            continue
-                        score = 0
-
-                        if ans_norm and ans_norm in opt_norm:
-                            score += 200 + len(ans_norm)
-                        for tok in tokens:
-                            if tok in opt_norm:
-                                score += len(tok)
-
-                        # Yes/No semantics support (very common).
-                        if ans_norm in {"yes", "no"}:
-                            if ans_norm == "yes" and ("yes" in opt_norm or "i am" in opt_norm):
-                                score += 250
-                            if ans_norm == "no" and ("no" in opt_norm or "i am not" in opt_norm or "do not" in opt_norm):
-                                score += 250
-
-                        if score > best_opt_score:
-                            best_opt_score = score
-                            best_idx = i
-
-                    # Require a meaningful match; otherwise leave for HITL.
-                    if best_idx >= 0 and best_opt_score >= 25:
-                        await maybe_await(options_loc.nth(best_idx).click(timeout=2500))
-                        clicked = True
-            except Exception:
-                clicked = False
-
-            if clicked:
-                count += 1
-
-        return count
-
-    async def _fill_cover_letter_text(self, page: Any, cover_letter_text: str) -> int:
-        evaluate_fn = getattr(page, "evaluate", None)
-        if evaluate_fn is None:
-            return 0
-        if not cover_letter_text.strip():
-            return 0
-
-        script = """
-        (text) => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-          const safeFocus = (el) => {
-            try { el && el.focus && el.focus({ preventScroll: true }); } catch (e) {}
-          };
-
-          const setNativeValue = (el, value) => {
-            const tag = (el.tagName || "").toLowerCase();
-            const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const desc = Object.getOwnPropertyDescriptor(proto, "value");
-            if (desc && typeof desc.set === "function") desc.set.call(el, value);
-            else el.value = value;
-          };
-
-          const labelTextFor = (el) => {
-            const parts = [];
-            const aria = el.getAttribute("aria-label");
-            if (aria) parts.push(aria);
-            const labelledBy = el.getAttribute("aria-labelledby");
-            if (labelledBy) {
-              for (const id of labelledBy.split(/\\s+/)) {
-                const n = document.getElementById(id);
-                if (n?.innerText) parts.push(n.innerText);
-              }
-            }
-            if (el.id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-              if (byFor?.innerText) parts.push(byFor.innerText);
-            }
-            const wrap = el.closest("label");
-            if (wrap?.innerText) parts.push(wrap.innerText);
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            for (let i = 0; i < 2 && root; i += 1) {
-              const legend = root.querySelector("legend");
-              if (legend?.innerText) parts.push(legend.innerText);
-              const labelLike = root.querySelector("label,h3,h4,p,strong,span,div");
-              if (labelLike?.innerText) parts.push(labelLike.innerText);
-              root = root.parentElement;
-            }
-            const placeholder = el.getAttribute("placeholder");
-            if (placeholder) parts.push(placeholder);
-            const name = el.getAttribute("name");
-            if (name) parts.push(name);
-            return parts.join(" ").replace(/\\s+/g, " ").trim();
-          };
-
-          let filled = 0;
-          const controls = Array.from(document.querySelectorAll("textarea, input[type='text'], input:not([type])"));
-          for (const el of controls) {
-            if (el.disabled || el.readOnly) continue;
-            if ((el.value || "").trim()) continue;
-            const hay = normalize(labelTextFor(el));
-            if (!hay) continue;
-            if (!hay.includes("cover letter")) continue;
-            safeFocus(el);
-            setNativeValue(el, text);
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            filled += 1;
-          }
-          return filled;
-        }
-        """
-        try:
-            result = await maybe_await(evaluate_fn(script, cover_letter_text))
-            if isinstance(result, int):
-                return result
-        except Exception:
-            return 0
-        return 0
-
-    async def _fill_inferred_fields(self, page: Any, standard_fields: dict[str, str]) -> int:
-        """
-        DOM-driven field filling that does not rely on platform-specific selectors.
-        This is the main reliability lever for unknown ATS / custom form layouts.
-        """
-        evaluate_fn = getattr(page, "evaluate", None)
-        if evaluate_fn is None:
-            return 0
-
-        # Normalize a few values up-front for common validation rules.
-        gpa = (standard_fields.get("gpa") or "").strip()
-        if gpa and "/" in gpa:
-            gpa = gpa.split("/", 1)[0].strip()
-
-        values = dict(standard_fields)
-        if gpa:
-            values["gpa"] = gpa
-        values.setdefault("portfolio", values.get("github") or values.get("linkedin") or "")
-
-        script = """
-        (values) => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-          const safeFocus = (el) => {
-            try { el && el.focus && el.focus({ preventScroll: true }); } catch (e) {}
-          };
-          const isHidden = (el) => {
-            if (!el) return true;
-            try {
-              const rect = el.getBoundingClientRect();
-              if (!rect || rect.width < 2 || rect.height < 2) return true;
-            } catch (e) {
-              return true;
-            }
-            let cur = el;
-            for (let i = 0; i < 5 && cur; i += 1) {
-              try {
-                const ariaHidden = normalize(cur.getAttribute ? (cur.getAttribute("aria-hidden") || "") : "");
-                if (ariaHidden === "true") return true;
-                const style = window.getComputedStyle(cur);
-                if (style.display === "none" || style.visibility === "hidden") return true;
-                const opacity = parseFloat(style.opacity || "1");
-                if (!Number.isNaN(opacity) && opacity < 0.05) return true;
-              } catch (e) {}
-              cur = cur.parentElement;
-            }
-            return false;
-          };
-
-          const setNativeValue = (el, value) => {
-            const tag = (el.tagName || "").toLowerCase();
-            const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const desc = Object.getOwnPropertyDescriptor(proto, "value");
-            if (desc && typeof desc.set === "function") desc.set.call(el, value);
-            else el.value = value;
-          };
-
-          const labelTextFor = (el) => {
-            const parts = [];
-            const aria = el.getAttribute("aria-label");
-            if (aria) parts.push(aria);
-            const labelledBy = el.getAttribute("aria-labelledby");
-            if (labelledBy) {
-              for (const id of labelledBy.split(/\\s+/)) {
-                const n = document.getElementById(id);
-                if (n?.innerText) parts.push(n.innerText);
-              }
-            }
-            if (el.id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-              if (byFor?.innerText) parts.push(byFor.innerText);
-            }
-            const wrap = el.closest("label");
-            if (wrap?.innerText) parts.push(wrap.innerText);
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            for (let i = 0; i < 2 && root; i += 1) {
-              const legend = root.querySelector("legend");
-              if (legend?.innerText) parts.push(legend.innerText);
-              const labelLike = root.querySelector("label,h3,h4,p,strong,span,div");
-              if (labelLike?.innerText) parts.push(labelLike.innerText);
-              root = root.parentElement;
-            }
-            const placeholder = el.getAttribute("placeholder");
-            if (placeholder) parts.push(placeholder);
-            const name = el.getAttribute("name");
-            if (name) parts.push(name);
-            const id = el.getAttribute("id");
-            if (id) parts.push(id);
-            const autocomplete = el.getAttribute("autocomplete");
-            if (autocomplete) parts.push(autocomplete);
-            return parts.join(" ").replace(/\\s+/g, " ").trim();
-          };
-
-          const scoreKey = (hay, key) => {
-            const h = normalize(hay);
-            const checks = {
-              first_name: ["first name", "given name", "forename", "firstname"],
-              last_name: ["last name", "surname", "family name", "lastname"],
-              full_name: ["full name", "your name", "name"],
-              email: ["email"],
-              phone: ["phone", "mobile", "cell"],
-              linkedin: ["linkedin"],
-              github: ["github"],
-              portfolio: ["portfolio", "website", "personal site", "url", "web site"],
-              school: ["school", "university", "college", "institution"],
-              degree: ["degree", "major", "field of study", "program"],
-              gpa: ["gpa", "grade point"],
-              graduation: ["graduation", "grad date", "expected graduation", "graduating"]
-            };
-            const needles = checks[key] || [];
-            let score = 0;
-            for (const n of needles) {
-              if (h.includes(n)) score += n.length;
-            }
-            return score;
-          };
-
-          const chooseKey = (el, hay) => {
-            const type = normalize(el.type || "");
-            const tag = normalize(el.tagName || "");
-
-            // Strong type hints.
-            if (type === "email") return "email";
-            if (type === "tel") return "phone";
-            if (type === "url") {
-              const h = normalize(hay);
-              if (h.includes("linkedin")) return "linkedin";
-              if (h.includes("github")) return "github";
-              if (h.includes("portfolio") || h.includes("website")) return "portfolio";
-              // Otherwise, pick a reasonable default.
-              return values.linkedin ? "linkedin" : "portfolio";
-            }
-
-            // Text/select inference by label/name/etc.
-            const keys = ["first_name","last_name","full_name","email","phone","linkedin","github","portfolio","school","degree","gpa","graduation"];
-            let bestKey = "";
-            let bestScore = 0;
-            for (const k of keys) {
-              let score = scoreKey(hay, k);
-              // Avoid over-filling generic "name" fields that are clearly not candidate name.
-              const h = normalize(hay);
-              if (k === "full_name" && score > 0) {
-                const bad = ["company", "employer", "business", "school", "university", "reference", "referrer", "manager"];
-                if (bad.some((b) => h.includes(b))) score = 0;
-              }
-              if (score > bestScore) {
-                bestScore = score;
-                bestKey = k;
-              }
-            }
-            if (bestScore < 4) return "";
-
-            // If we have first+last, prefer those instead of full_name for ambiguous "name" labels.
-            if (bestKey === "full_name" && values.first_name && values.last_name) {
-              const h = normalize(hay);
-              if (hasFirstNameField && hasLastNameField && !h.includes("full") && !h.includes("your name")) return "";
-            }
-
-            // Some controls should only be filled if we have a value.
-            if (!values[bestKey]) return "";
-            return bestKey;
-          };
-
-          const fillControl = (el, value) => {
-            const tag = normalize(el.tagName || "");
-            const type = normalize(el.type || "");
-            if (tag === "select") {
-              const opts = Array.from(el.options || []);
-              const targetNorm = normalize(value);
-              const exact = opts.find((o) => normalize(o.textContent) === targetNorm || normalize(o.value) === targetNorm);
-              const partial = opts.find((o) => normalize(o.textContent).includes(targetNorm) || normalize(o.value).includes(targetNorm));
-              const match = exact || partial;
-              if (match) {
-                el.value = match.value;
-                el.dispatchEvent(new Event("input", { bubbles: true }));
-                el.dispatchEvent(new Event("change", { bubbles: true }));
-                return true;
-              }
-              return false;
-            }
-
-            if (type === "radio") return false;
-            if (type === "checkbox") return false;
-            if (type === "file") return false;
-
-            if ("value" in el) {
-              const existing = (el.value || "").trim();
-              if (existing) return false;
-              safeFocus(el);
-              setNativeValue(el, value);
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              el.dispatchEvent(new Event("change", { bubbles: true }));
-              return true;
-            }
-            return false;
-          };
-
-          const controls = Array.from(document.querySelectorAll("input,textarea,select"));
-          const hasFirstNameField = controls.some((el) => {
-            const h = normalize(labelTextFor(el));
-            return h.includes("first name") || h.includes("firstname") || h.includes("given name") || h.includes("given-name");
-          });
-          const hasLastNameField = controls.some((el) => {
-            const h = normalize(labelTextFor(el));
-            return h.includes("last name") || h.includes("lastname") || h.includes("surname") || h.includes("family name") || h.includes("family-name");
-          });
-          let filled = 0;
-          for (const el of controls) {
-            if (el.disabled || el.readOnly) continue;
-            if (isHidden(el)) continue;
-            const type = normalize(el.type || "");
-            if (type === "hidden" || type === "submit" || type === "button" || type === "reset") continue;
-            if (type === "password") continue;
-            if (type === "file") continue;
-
-            const hay = labelTextFor(el);
-            if (!hay) continue;
-            const key = chooseKey(el, hay);
-            if (!key) continue;
-
-            const value = values[key] || "";
-            if (!value) continue;
-
-            if (fillControl(el, value)) filled += 1;
-          }
-          return filled;
-        }
-        """
-
-        try:
-            result = await maybe_await(evaluate_fn(script, values))
-            if isinstance(result, int):
-                return result
-        except Exception:
-            return 0
-        return 0
 
     async def _find_missing_required_fields(self, page: Any) -> list[dict[str, str]]:
         evaluate_fn = getattr(page, "evaluate", None)
@@ -2926,81 +966,6 @@ class BaseATSHandler:
             return []
         return []
 
-    async def _fill_name_like_fields(self, page: Any, full_name: str) -> int:
-        if not full_name.strip():
-            return 0
-
-        evaluate_fn = getattr(page, "evaluate", None)
-        if evaluate_fn is None:
-            return 0
-
-        script = """
-        (fullName) => {
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-          const safeFocus = (el) => {
-            try { el && el.focus && el.focus({ preventScroll: true }); } catch (e) {}
-          };
-          let filled = 0;
-
-          const labels = Array.from(document.querySelectorAll("label,legend,p,span,div,strong"));
-          const visited = new Set();
-
-          function getControl(node) {
-            if (!node) return null;
-            if (node.tagName === "LABEL") {
-              if (node.htmlFor) {
-                const byFor = document.getElementById(node.htmlFor);
-                if (byFor) return byFor;
-              }
-              const nested = node.querySelector("input,textarea");
-              if (nested) return nested;
-            }
-            let root = node.closest("fieldset,section,div,li,tr,td,dd,form") || node.parentElement;
-            while (root) {
-              const candidate = root.querySelector("input[type='text'],input:not([type]),textarea");
-              if (candidate) return candidate;
-              root = root.parentElement;
-            }
-            return null;
-          }
-
-          for (const node of labels) {
-            const text = normalize(node.innerText);
-            if (!text || text.length < 3) continue;
-            if (!text.includes("name")) continue;
-            if (text.includes("first") || text.includes("last") || text.includes("preferred")) continue;
-
-            const control = getControl(node);
-            if (!control || visited.has(control)) continue;
-            if (control.disabled || control.readOnly) continue;
-            if ((control.value || "").trim()) continue;
-
-            safeFocus(control);
-            control.value = fullName;
-            control.dispatchEvent(new Event("input", { bubbles: true }));
-            control.dispatchEvent(new Event("change", { bubbles: true }));
-            visited.add(control);
-            filled += 1;
-          }
-          return filled;
-        }
-        """
-
-        try:
-            result = await maybe_await(evaluate_fn(script, full_name))
-            if isinstance(result, int):
-                return result
-        except Exception:
-            return 0
-        return 0
-
-    # =========================================================================
-    # Unified snapshot-and-fill: one single pass over all visible form fields.
-    # For dropdowns we ALWAYS click-open → read options → pick best → click.
-    # For text inputs we only fill if empty.
-    # For checkboxes we only check if unchecked and answer is truthy.
-    # =========================================================================
-
     async def _pre_fill_special_controls(self, page: Any, ctx: Any) -> None:
         """Override in ATS subclasses to handle non-standard controls before snapshot-and-fill."""
         pass
@@ -3051,9 +1016,9 @@ class BaseATSHandler:
             ("how did you hear", how_heard_answer),
             ("where did you hear", how_heard_answer),
             ("source", how_heard_answer),
-            ("start date", "Summer 2026"),
-            ("when can you start", "Summer 2026"),
-            ("available to start", "Summer 2026"),
+            ("start date", "06/01/2026"),
+            ("when can you start", "06/01/2026"),
+            ("available to start", "06/01/2026"),
             ("salary expectation", "Open / Negotiable"),
             ("compensation expectation", "Open / Negotiable"),
             ("desired salary", "Open / Negotiable"),
@@ -3154,12 +1119,12 @@ class BaseATSHandler:
               if (t && !normalize(t).match(/^(select|choose|pick|--)/)) options.push(t);
             }
             controls.push({
-              kind: "select", selector: selectorFor(el), label: labelFor(el),
+              kind: "native_select", selector: selectorFor(el), label: labelFor(el),
               value: "", options, tag: "select"
             });
           }
 
-          // --- All combobox/autocomplete inputs ---
+          // --- ARIA combobox / autocomplete inputs ---
           for (const el of document.querySelectorAll("[role='combobox'], [aria-haspopup='listbox']")) {
             if (el.disabled || isHidden(el)) continue;
             const tag = el.tagName.toLowerCase();
@@ -3167,20 +1132,31 @@ class BaseATSHandler:
             // Check if already has value
             const val = normalize(el.value || el.getAttribute("aria-valuetext") || "");
             if (val && !val.includes("select") && !val.includes("choose")) continue;
-            // Check react-select single value
-            const ctrl = el.closest(".select__control") || el.parentElement;
+            // Detect react-select by ancestor class
+            const rsCtrl = el.closest(".select__control") || el.closest(".select__container");
+            if (rsCtrl) {
+              const sv = rsCtrl.querySelector(".select__single-value");
+              if (sv && normalize(sv.innerText || "").length > 0) continue;
+              controls.push({
+                kind: "react_select", selector: selectorFor(el), label: labelFor(el),
+                value: "", options: [], tag
+              });
+              continue;
+            }
+            // Check react-select single value on parent
+            const ctrl = el.parentElement;
             if (ctrl) {
               const sv = ctrl.querySelector(".select__single-value");
               if (sv && normalize(sv.innerText || "").length > 0) continue;
             }
             controls.push({
-              kind: "combobox", selector: selectorFor(el), label: labelFor(el),
+              kind: "aria_combobox", selector: selectorFor(el), label: labelFor(el),
               value: "", options: [], tag
             });
           }
 
           // --- Workday custom dropdown buttons (button inside fieldset, text = "Select One") ---
-          const seenComboSelectors = new Set(controls.filter(c => c.kind === "combobox").map(c => c.selector));
+          const seenComboSelectors = new Set(controls.filter(c => c.kind === "aria_combobox" || c.kind === "react_select").map(c => c.selector));
           for (const el of document.querySelectorAll("button[type='button']")) {
             if (el.disabled || isHidden(el)) continue;
             const btnText = normalize(el.innerText || "");
@@ -3192,7 +1168,7 @@ class BaseATSHandler:
             const sel = selectorFor(el);
             if (seenComboSelectors.has(sel)) continue;
             controls.push({
-              kind: "combobox", selector: sel, label: labelFor(el),
+              kind: "workday_button_dropdown", selector: sel, label: labelFor(el),
               value: "", options: [], tag: "button"
             });
           }
@@ -3210,21 +1186,113 @@ class BaseATSHandler:
             const val = (el.value || "").trim();
             if (val) continue; // already filled
             controls.push({
-              kind: "text", selector: selectorFor(el), label: labelFor(el),
+              kind: "native_text", selector: selectorFor(el), label: labelFor(el),
               value: "", options: [], tag: el.tagName.toLowerCase()
             });
           }
 
-          // --- All unchecked checkboxes ---
+          // --- All unchecked native checkboxes ---
+          const groupedCheckboxSelectors = new Set();
+          // First pass: detect checkbox groups inside formField containers
+          for (const container of document.querySelectorAll("[data-automation-id^='formField']")) {
+            const cbs = container.querySelectorAll("input[type='checkbox']");
+            const visibleCbs = [];
+            for (const cb of cbs) {
+              if (!cb.disabled && !cb.checked && !isHidden(cb)) visibleCbs.push(cb);
+            }
+            if (visibleCbs.length < 2) continue;
+            // Extract question text from legend or label in this container
+            let qText = "";
+            const legend = container.querySelector("legend");
+            if (legend && legend.innerText) qText = legend.innerText.trim();
+            if (!qText) {
+              const lbl = container.querySelector("label");
+              if (lbl && lbl.innerText) qText = lbl.innerText.trim();
+            }
+            if (!qText) {
+              // Try the formField's own direct text child or first child element
+              const formLabel = container.querySelector("[data-automation-id*='formLabel']");
+              if (formLabel && formLabel.innerText) qText = formLabel.innerText.trim();
+            }
+            if (!qText) continue;
+            // Remove individual option labels from question text
+            const cbOptions = [];
+            for (const cb of visibleCbs) {
+              const sel = selectorFor(cb);
+              groupedCheckboxSelectors.add(sel);
+              const optLabel = labelFor(cb);
+              cbOptions.push({ label: optLabel, value: cb.value || "", selector: sel });
+            }
+            controls.push({
+              kind: "checkbox_group",
+              selector: selectorFor(visibleCbs[0]),
+              label: qText.replace(/\s+/g, " ").trim(),
+              value: "",
+              options: cbOptions.map(o => o.label),
+              tag: "input",
+              _checkboxOptions: cbOptions,
+            });
+          }
+          // Second pass: individual unchecked checkboxes NOT in a group
           for (const el of document.querySelectorAll("input[type='checkbox']")) {
             if (el.disabled || el.checked || isHidden(el)) continue;
+            const sel = selectorFor(el);
+            if (groupedCheckboxSelectors.has(sel)) continue;
             controls.push({
-              kind: "checkbox", selector: selectorFor(el), label: labelFor(el),
+              kind: "native_checkbox", selector: sel, label: labelFor(el),
               value: "false", options: [], tag: "input"
             });
           }
 
-          // --- Radio groups (unchecked) ---
+          // --- ARIA checkboxes (role="checkbox", not already checked) ---
+          for (const el of document.querySelectorAll("[role='checkbox']")) {
+            if (isHidden(el)) continue;
+            if (el.getAttribute("aria-checked") === "true") continue;
+            if (el.tagName.toLowerCase() === "input" && el.type === "checkbox") continue; // already captured above
+            controls.push({
+              kind: "aria_checkbox", selector: selectorFor(el), label: labelFor(el),
+              value: "false", options: [], tag: el.tagName.toLowerCase()
+            });
+          }
+
+          // --- Workday date pickers (MM/DD/YYYY spinbuttons) ---
+          for (const wrapper of document.querySelectorAll("[data-automation-id='dateInputWrapper']")) {
+            if (isHidden(wrapper)) continue;
+            // Find the Month spinbutton input inside
+            const monthInput = wrapper.querySelector("input[role='spinbutton'][id*='dateSectionMonth']");
+            if (!monthInput) continue;
+            // Already filled? Check if any spinbutton has a value
+            const allSpinbuttons = wrapper.querySelectorAll("input[role='spinbutton']");
+            let anyFilled = false;
+            for (const sb of allSpinbuttons) {
+              if ((sb.value || "").trim()) { anyFilled = true; break; }
+            }
+            if (anyFilled) continue;
+            // Walk up to find the parent formField container for question text
+            let qText = "";
+            let parent = wrapper.parentElement;
+            for (let i = 0; i < 8 && parent; i++) {
+              const aid = parent.getAttribute("data-automation-id") || "";
+              if (aid.startsWith("formField")) {
+                const legend = parent.querySelector("legend");
+                if (legend && legend.innerText) { qText = legend.innerText.trim(); break; }
+                const lbl = parent.querySelector("label");
+                if (lbl && lbl.innerText) { qText = lbl.innerText.trim(); break; }
+              }
+              parent = parent.parentElement;
+            }
+            if (!qText) continue;
+            controls.push({
+              kind: "workday_date",
+              selector: selectorFor(monthInput),
+              label: qText.replace(/\s+/g, " ").trim(),
+              value: "",
+              options: [],
+              tag: "input",
+            });
+          }
+
+          // --- Native radio groups (unchecked) ---
           const radioNames = {};
           for (const el of document.querySelectorAll("input[type='radio']")) {
             if (el.disabled || isHidden(el)) continue;
@@ -3251,8 +1319,53 @@ class BaseATSHandler:
           for (const [nm, rg] of Object.entries(radioNames)) {
             if (rg.anyChecked || !rg.label) continue;
             controls.push({
-              kind: "radio", selector: "", label: rg.label.replace(/\s+/g, " ").trim(),
+              kind: "native_radio", selector: "", label: rg.label.replace(/\s+/g, " ").trim(),
               value: "", options: rg.options.map(o => o.label), tag: "input",
+              _radioOptions: rg.options
+            });
+          }
+
+          // --- ARIA radio groups (role="radio", not inside a native radio group) ---
+          const ariaRadioGroups = {};
+          for (const el of document.querySelectorAll("[role='radio']")) {
+            if (isHidden(el)) continue;
+            // Skip if this is actually a native radio input already captured
+            if (el.tagName.toLowerCase() === "input" && el.type === "radio") continue;
+            // Group by closest radiogroup or fieldset
+            const group = el.closest("[role='radiogroup']") || el.closest("fieldset");
+            const groupKey = group ? selectorFor(group) : ("__aria_rg_" + controls.length);
+            if (!ariaRadioGroups[groupKey]) ariaRadioGroups[groupKey] = { options: [], anyChecked: false, label: "" };
+            const checked = el.getAttribute("aria-checked") === "true";
+            if (checked) ariaRadioGroups[groupKey].anyChecked = true;
+            const optLabel = (el.getAttribute("aria-label") || el.innerText || "").trim();
+            ariaRadioGroups[groupKey].options.push({
+              label: optLabel, value: optLabel, selector: selectorFor(el)
+            });
+            if (!ariaRadioGroups[groupKey].label && group) {
+              const lg = group.querySelector("legend");
+              if (lg && lg.innerText) ariaRadioGroups[groupKey].label = lg.innerText;
+              if (!ariaRadioGroups[groupKey].label) {
+                const lbl = group.getAttribute("aria-label");
+                if (lbl) ariaRadioGroups[groupKey].label = lbl;
+              }
+              if (!ariaRadioGroups[groupKey].label) {
+                let p = group.parentElement;
+                for (let i = 0; i < 3 && p; i++) {
+                  const h = p.querySelector("label,h3,h4,p.question,legend,strong");
+                  if (h && h.innerText && h.innerText.length > 3) {
+                    ariaRadioGroups[groupKey].label = h.innerText;
+                    break;
+                  }
+                  p = p.parentElement;
+                }
+              }
+            }
+          }
+          for (const [gk, rg] of Object.entries(ariaRadioGroups)) {
+            if (rg.anyChecked || !rg.label || !rg.options.length) continue;
+            controls.push({
+              kind: "aria_radio", selector: "", label: rg.label.replace(/\s+/g, " ").trim(),
+              value: "", options: rg.options.map(o => o.label), tag: "div",
               _radioOptions: rg.options
             });
           }
@@ -3346,7 +1459,7 @@ class BaseATSHandler:
                             break
 
             # 3. For custom questions (text/textarea only), use LLM
-            if answer is None and kind in ("text", "combobox") and len(label) >= 12:
+            if answer is None and kind in ("native_text", "aria_combobox", "react_select", "workday_button_dropdown", "checkbox_group", "workday_date") and len(label) >= 12:
                 # Skip standard hint fields for LLM
                 std_hints = {"first name", "last name", "email", "phone", "linkedin",
                              "github", "school", "university", "degree", "gpa",
@@ -3379,26 +1492,18 @@ class BaseATSHandler:
             ans_preview = answer[:50] + ("..." if len(answer) > 50 else "")
             logger.info("  [%d] %s -> '%s' (via %s)", i+1, label_preview[:50], ans_preview, answer_source)
 
-            # --- Fill the control based on its kind ---
+            # --- Fill the control based on its kind (deterministic protocol dispatch) ---
             try:
-                if kind == "select":
-                    filled = await self._fill_select_dropdown(page, selector, answer, options)
-                elif kind == "combobox":
-                    filled = await self._fill_combobox_dropdown(page, selector, answer, label, question_answerer=ctx.question_answerer)
-                elif kind == "checkbox":
-                    truthy = {"yes", "true", "y", "1", "on", "checked", "i agree",
-                              "i acknowledge", "i acknowledge and agree", "i consent"}
-                    ans_norm = answer.strip().lower()
-                    if ans_norm in truthy:
-                        filled = await self._check_checkbox(page, selector)
+                method_name = self._FILL_PROTOCOLS.get(kind)
+                if method_name:
+                    protocol = getattr(self, method_name, None)
+                    if protocol:
+                        filled = await protocol(page, answer, ctrl, ctx=ctx)
                     else:
-                        filled = True  # answer is "false" / "no" -- intentionally not checking
-                elif kind == "radio":
-                    radio_opts = ctrl.get("_radioOptions") or []
-                    filled = await self._fill_radio_group(page, answer, radio_opts)
-                elif kind == "text":
-                    filled = await self._fill_text_field(page, selector, answer)
+                        logger.debug("  [%d] no protocol method '%s' for kind '%s'", i+1, method_name, kind)
+                        filled = False
                 else:
+                    logger.debug("  [%d] unknown control kind '%s', skipping", i+1, kind)
                     filled = False
 
                 if filled:
@@ -3408,7 +1513,849 @@ class BaseATSHandler:
 
         return (fields_filled, custom_q_count)
 
-    # --- Individual fill strategies ---
+    # --- Deterministic fill protocols ---
+    # Each has signature: async def _proto_X(self, page, answer, ctrl, *, ctx=None) -> bool
+
+    async def _proto_native_select(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Native <select>: fuzzy-match answer to options, then Playwright select_option."""
+        selector = str(ctrl.get("selector") or "").strip()
+        options = ctrl.get("options") or []
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn or not selector:
+            return False
+        best_idx, best_score = self._best_option_match(answer, options)
+        if best_idx < 0:
+            logger.debug("    native_select: no match for '%s' in %s", answer[:30], [o[:20] for o in options[:5]])
+            return False
+        best_opt = options[best_idx]
+        loc = locator_fn(selector).first
+        try:
+            await maybe_await(loc.select_option(label=best_opt, timeout=3000))
+            logger.debug("    native_select: picked '%s' (score=%d)", best_opt[:40], best_score)
+            return True
+        except Exception:
+            try:
+                await maybe_await(loc.select_option(value=best_opt, timeout=2000))
+                return True
+            except Exception:
+                return False
+
+    async def _proto_native_text(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Native <input type='text'> / <textarea>: Playwright .fill() with emptiness pre-check."""
+        selector = str(ctrl.get("selector") or "").strip()
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn or not selector:
+            return False
+        try:
+            loc = locator_fn(selector).first
+            # Double-check it's still empty
+            try:
+                current = str(await maybe_await(loc.input_value()) or "").strip()
+            except Exception:
+                try:
+                    current = str(await maybe_await(loc.inner_text()) or "").strip()
+                except Exception:
+                    current = ""
+            if current:
+                logger.debug("    native_text: already has value '%s', skipping.", current[:30])
+                return False
+            await maybe_await(loc.fill(answer, timeout=3000))
+            return True
+        except Exception:
+            return False
+
+    async def _proto_native_radio(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Native <input type='radio'>: fuzzy-match answer, Playwright .check() or JS fallback."""
+        radio_options = ctrl.get("_radioOptions") or []
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn or not radio_options:
+            return False
+
+        best_opt = self._match_radio_option(answer, radio_options)
+        if best_opt is None:
+            return False
+
+        sel = str(best_opt.get("selector") or "").strip()
+        if sel:
+            # Primary: Try clicking the associated <label> first (for React compatibility)
+            try:
+                clicked_label = await maybe_await(page.evaluate(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        let label = null;
+                        if (el.id) {
+                            label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                        }
+                        if (!label) {
+                            label = el.closest('label');
+                        }
+                        if (label) {
+                            label.scrollIntoView({block: 'center'});
+                            label.click();
+                            return true;
+                        }
+                        return false;
+                    }""",
+                    sel,
+                ))
+                if clicked_label:
+                    return True
+            except Exception:
+                pass
+
+            # Fallback: Playwright .check()
+            try:
+                loc = locator_fn(sel).first
+                check_fn = getattr(loc, "check", None)
+                if check_fn:
+                    await maybe_await(check_fn(timeout=2000))
+                else:
+                    await maybe_await(loc.click(timeout=2000))
+                return True
+            except Exception:
+                pass
+
+        # JS fallback: find the element by selector or index and click via JS
+        evaluate_fn = getattr(page, "evaluate", None)
+        if sel and evaluate_fn:
+            try:
+                clicked = await maybe_await(evaluate_fn(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        // Try clicking the label instead of the radio input for React compatibility
+                        let label = null;
+                        if (el.id) {
+                            label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                        }
+                        if (!label) {
+                            label = el.closest('label');
+                        }
+                        if (label) {
+                            label.scrollIntoView({block: 'center'});
+                            label.click();
+                            return true;
+                        }
+                        // Fallback to clicking the radio directly if no label found
+                        el.scrollIntoView({block:'center'});
+                        el.click();
+                        return true;
+                    }""",
+                    sel,
+                ))
+                if clicked:
+                    return True
+            except Exception:
+                pass
+
+        # Last resort: find by option index in the group
+        if evaluate_fn:
+            opt_idx = radio_options.index(best_opt) if best_opt in radio_options else -1
+            group_name = str(best_opt.get("value") or "")
+            if opt_idx >= 0:
+                try:
+                    # Try clicking the nth radio with the same name
+                    first_opt = radio_options[0]
+                    first_sel = str(first_opt.get("selector") or "")
+                    clicked = await maybe_await(evaluate_fn(
+                        """(args) => {
+                            const radios = document.querySelectorAll('input[type="radio"]');
+                            const matching = [];
+                            for (const r of radios) {
+                                const rect = r.getBoundingClientRect();
+                                if (rect.width >= 1 && rect.height >= 1) matching.push(r);
+                            }
+                            // Try to find by value
+                            for (const r of matching) {
+                                if (r.value === args.value) {
+                                    // Click the label instead of the radio input for React compatibility
+                                    let label = null;
+                                    if (r.id) {
+                                        label = document.querySelector('label[for="' + CSS.escape(r.id) + '"]');
+                                    }
+                                    if (!label) {
+                                        label = r.closest('label');
+                                    }
+                                    if (label) {
+                                        label.scrollIntoView({block: 'center'});
+                                        label.click();
+                                        return true;
+                                    }
+                                    // Fallback to clicking the radio directly if no label found
+                                    r.scrollIntoView({block:'center'});
+                                    r.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""",
+                        {"value": group_name},
+                    ))
+                    if clicked:
+                        return True
+                except Exception:
+                    pass
+
+        return False
+
+    async def _proto_native_checkbox(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Native <input type='checkbox'>: check if answer is truthy, then Playwright .check()."""
+        selector = str(ctrl.get("selector") or "").strip()
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn or not selector:
+            return False
+        truthy = {"yes", "true", "y", "1", "on", "checked", "i agree",
+                  "i acknowledge", "i acknowledge and agree", "i consent"}
+        ans_norm = answer.strip().lower()
+        if ans_norm not in truthy:
+            return True  # answer is "false" / "no" — intentionally not checking
+        try:
+            loc = locator_fn(selector).first
+            check_fn = getattr(loc, "check", None)
+            if check_fn:
+                await maybe_await(check_fn(timeout=2000))
+            else:
+                await maybe_await(loc.click(timeout=2000))
+            return True
+        except Exception:
+            return False
+
+    async def _proto_checkbox_group(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Checkbox group: fuzzy-match answer against option labels, click the matching label."""
+        import asyncio as _asyncio
+        cb_options = ctrl.get("_checkboxOptions") or []
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn or not cb_options:
+            return False
+
+        # Use the same fuzzy matching as radio buttons
+        best_opt = self._match_radio_option(answer, cb_options)
+        if best_opt is None:
+            logger.debug("  checkbox_group: no matching option for answer '%s'", answer)
+            return False
+
+        sel = str(best_opt.get("selector") or "").strip()
+        if not sel:
+            return False
+
+        logger.debug("  checkbox_group: best match sel='%s', label='%s'", sel, best_opt.get("label", ""))
+
+        # Use Playwright locator to get the element handle (handles CSS escape sequences
+        # like #\36 properly), then pass the handle to page.evaluate for label clicking.
+        try:
+            loc = locator_fn(sel).first
+            element_handle = await maybe_await(loc.element_handle(timeout=5000))
+            if element_handle:
+                clicked = await maybe_await(page.evaluate(
+                    """(el) => {
+                        let label = null;
+                        if (el.id) {
+                            label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                        }
+                        if (!label) {
+                            label = el.closest('label');
+                        }
+                        if (label) {
+                            label.click();
+                            return 'label';
+                        }
+                        el.click();
+                        return 'direct';
+                    }""",
+                    element_handle,
+                ))
+                logger.debug("  checkbox_group: clicked via %s", clicked)
+                await _asyncio.sleep(0.3)
+                return True
+        except Exception as exc:
+            logger.debug("  checkbox_group: element handle approach failed: %s", exc)
+
+        # Fallback: Playwright check
+        try:
+            loc = locator_fn(sel).first
+            check_fn = getattr(loc, "check", None)
+            if check_fn:
+                await maybe_await(check_fn(timeout=2000))
+            else:
+                await maybe_await(loc.click(force=True, timeout=2000))
+            logger.debug("  checkbox_group: clicked via Playwright fallback")
+            return True
+        except Exception as exc:
+            logger.debug("  checkbox_group: Playwright fallback also failed: %s", exc)
+            return False
+
+    async def _proto_workday_date(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Workday date picker (MM/DD/YYYY spinbuttons): parse date and type into spinbuttons.
+
+        Extends the existing MM/YYYY spinbutton pattern from work experience filling.
+        Strategy: click the Month spinbutton, type MMDDYYYY as continuous string —
+        Workday auto-tabs from Month to Day to Year.
+        """
+        import asyncio as _asyncio
+        import re as _re
+
+        selector = str(ctrl.get("selector") or "").strip()
+        locator_fn = getattr(page, "locator", None)
+        keyboard = getattr(page, "keyboard", None)
+        if not locator_fn or not selector or not keyboard:
+            return False
+
+        # Parse the answer into MM, DD, YYYY
+        ans = answer.strip()
+        mm, dd, yyyy = "", "", ""
+
+        # Handle __TODAY__ sentinel — use today's date
+        if ans.upper() == "__TODAY__":
+            from datetime import datetime
+            now = datetime.now()
+            mm, dd, yyyy = f"{now.month:02d}", f"{now.day:02d}", str(now.year)
+        else:
+            # Try MM/DD/YYYY or MM-DD-YYYY
+            m = _re.match(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})", ans)
+            if m:
+                mm, dd, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+            else:
+                # Try YYYY-MM-DD (ISO format)
+                m = _re.match(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})", ans)
+                if m:
+                    yyyy, mm, dd = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
+                else:
+                    # Try YYYY-MM (use 1st of month)
+                    m = _re.match(r"(\d{4})[/\-](\d{1,2})", ans)
+                    if m:
+                        yyyy, mm, dd = m.group(1), m.group(2).zfill(2), "01"
+                    else:
+                        # Fallback: try to extract any date-like content
+                        # "Summer 2026" -> 06/01/2026
+                        season_map = {"spring": "03", "summer": "06", "fall": "09", "autumn": "09", "winter": "01"}
+                        ans_lower = ans.lower()
+                        for season, month in season_map.items():
+                            if season in ans_lower:
+                                year_m = _re.search(r"(\d{4})", ans)
+                                if year_m:
+                                    mm, dd, yyyy = month, "01", year_m.group(1)
+                                    break
+                        if not mm:
+                            # "ASAP" or "immediately" -> today + 14 days
+                            if any(w in ans_lower for w in ("asap", "immediately", "right away", "now")):
+                                from datetime import datetime, timedelta
+                                target = datetime.now() + timedelta(days=14)
+                                mm, dd, yyyy = f"{target.month:02d}", f"{target.day:02d}", str(target.year)
+
+        if not mm or not dd or not yyyy:
+            logger.debug("  workday_date: could not parse '%s' into MM/DD/YYYY", ans)
+            return False
+
+        # Click the Month spinbutton and type MMDDYYYY as continuous string.
+        # Use JS el.click() to bypass Playwright's viewport assertion
+        # (Workday nests spinbuttons in scroll containers Playwright can't reach).
+        try:
+            loc = locator_fn(selector).first
+            element_handle = await maybe_await(loc.element_handle(timeout=5000))
+            if element_handle:
+                await maybe_await(page.evaluate("(el) => el.click()", element_handle))
+            else:
+                await maybe_await(loc.click(force=True, timeout=3000))
+            await _asyncio.sleep(0.3)
+            date_str = f"{mm}{dd}{yyyy}"
+            await maybe_await(keyboard.type(date_str))
+            logger.debug("  workday_date: typed '%s' (from answer '%s')", date_str, ans)
+            return True
+        except Exception as exc:
+            logger.debug("  workday_date: continuous type failed: %s — trying individual fill", exc)
+
+        # Fallback: fill each spinbutton individually.
+        # Scope selectors to the specific date field ID prefix.
+        month_id = str(ctrl.get("selector") or "")
+        base_prefix = ""
+        if "dateSectionMonth" in month_id:
+            base_prefix = month_id.split("dateSectionMonth")[0].lstrip("#")
+        try:
+            for part, val in [("Month", mm), ("Day", dd), ("Year", yyyy)]:
+                try:
+                    if base_prefix:
+                        sb_sel = f"[id='{base_prefix}dateSection{part}-input']"
+                    else:
+                        sb_sel = f"[id*='dateSection{part}-input']"
+                    sb = locator_fn(sb_sel).first
+                    sb_handle = await maybe_await(sb.element_handle(timeout=3000))
+                    if sb_handle:
+                        await maybe_await(page.evaluate("(el) => el.click()", sb_handle))
+                    else:
+                        await maybe_await(sb.click(force=True, timeout=2000))
+                    await _asyncio.sleep(0.2)
+                    await maybe_await(keyboard.type(val))
+                    await _asyncio.sleep(0.2)
+                except Exception:
+                    continue
+            return True
+        except Exception as exc:
+            logger.debug("  workday_date: individual fill also failed: %s", exc)
+            return False
+
+    async def _proto_aria_combobox(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """ARIA combobox (role='combobox'): click open, read options, fuzzy match, click."""
+        import asyncio as _asyncio
+        selector = str(ctrl.get("selector") or "").strip()
+        label = str(ctrl.get("label") or "").strip()
+        locator_fn = getattr(page, "locator", None)
+        keyboard_obj = getattr(page, "keyboard", None)
+        if not locator_fn or not selector:
+            return False
+
+        loc = locator_fn(selector).first
+        try:
+            if not await maybe_await(loc.is_visible()):
+                return False
+        except Exception:
+            return False
+
+        try:
+            await maybe_await(loc.scroll_into_view_if_needed(timeout=2000))
+        except Exception:
+            pass
+
+        press_fn = getattr(keyboard_obj, "press", None) if keyboard_obj else None
+        type_fn = getattr(keyboard_obj, "type", None) if keyboard_obj else None
+
+        # Click to open dropdown
+        try:
+            await maybe_await(loc.click(timeout=2000))
+        except Exception:
+            return False
+        await _asyncio.sleep(0.4)
+
+        # Read options
+        option_texts, option_locs = await self._read_dropdown_options(page)
+        logger.debug("    aria_combobox: found %d options after click-open", len(option_texts))
+
+        # If too many or zero, type to filter
+        if len(option_texts) >= 25 or len(option_texts) == 0:
+            option_texts, option_locs = await self._type_to_filter_dropdown(
+                page, loc, answer, press_fn, type_fn
+            )
+
+        # Fuzzy match and click
+        if option_texts and option_locs:
+            best_idx, best_score = self._best_option_match(answer, option_texts)
+            if best_idx < 0 and len(option_texts) == 1:
+                best_idx, best_score = 0, 1
+            if best_idx >= 0:
+                try:
+                    await maybe_await(option_locs[best_idx].click(timeout=2000))
+                    logger.debug("    aria_combobox: clicked '%s' (score=%d)", option_texts[best_idx][:40], best_score)
+                    return True
+                except Exception:
+                    pass
+            else:
+                # LLM fallback
+                qa = getattr(ctx, "question_answerer", None) if ctx else None
+                if qa is not None:
+                    pick_fn = getattr(qa, "pick_option", None)
+                    if pick_fn:
+                        try:
+                            llm_idx = pick_fn(question_label=label, intended_answer=answer, options=option_texts)
+                            if llm_idx is not None and 0 <= llm_idx < len(option_locs):
+                                await maybe_await(option_locs[llm_idx].click(timeout=2000))
+                                return True
+                        except Exception:
+                            pass
+
+        # Last resort: type + Tab
+        return await self._type_and_tab_fallback(page, loc, answer, press_fn, type_fn)
+
+    async def _proto_aria_radio(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """ARIA radio (role='radio'): fuzzy-match answer, JS el.click() since these are divs/spans."""
+        radio_options = ctrl.get("_radioOptions") or []
+        evaluate_fn = getattr(page, "evaluate", None)
+        if not evaluate_fn or not radio_options:
+            return False
+
+        best_opt = self._match_radio_option(answer, radio_options)
+        if best_opt is None:
+            return False
+
+        sel = str(best_opt.get("selector") or "").strip()
+        if not sel:
+            return False
+
+        # Use JS click — Playwright .check() doesn't work on non-input elements
+        try:
+            clicked = await maybe_await(evaluate_fn(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return true;
+                }""",
+                sel,
+            ))
+            if clicked:
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.3)
+                logger.debug("    aria_radio: JS-clicked option '%s'", str(best_opt.get("label", ""))[:40])
+                return True
+        except Exception:
+            pass
+
+        # Fallback: try Playwright click
+        locator_fn = getattr(page, "locator", None)
+        if locator_fn:
+            try:
+                loc = locator_fn(sel).first
+                await maybe_await(loc.click(timeout=2000))
+                return True
+            except Exception:
+                pass
+
+        return False
+
+    async def _proto_aria_checkbox(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """ARIA checkbox (role='checkbox'): truthy check, then JS el.click()."""
+        selector = str(ctrl.get("selector") or "").strip()
+        evaluate_fn = getattr(page, "evaluate", None)
+        if not evaluate_fn or not selector:
+            return False
+        truthy = {"yes", "true", "y", "1", "on", "checked", "i agree",
+                  "i acknowledge", "i acknowledge and agree", "i consent"}
+        ans_norm = answer.strip().lower()
+        if ans_norm not in truthy:
+            return True  # intentionally not checking
+        try:
+            clicked = await maybe_await(evaluate_fn(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return true;
+                }""",
+                selector,
+            ))
+            return bool(clicked)
+        except Exception:
+            # Fallback: Playwright click
+            locator_fn = getattr(page, "locator", None)
+            if locator_fn:
+                try:
+                    loc = locator_fn(selector).first
+                    await maybe_await(loc.click(timeout=2000))
+                    return True
+                except Exception:
+                    pass
+            return False
+
+    async def _proto_workday_button_dropdown(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """Workday <button> dropdown ('Select One'): click button, read promptOption options, pick."""
+        import asyncio as _asyncio
+        selector = str(ctrl.get("selector") or "").strip()
+        label = str(ctrl.get("label") or "").strip()
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn or not selector:
+            return False
+
+        loc = locator_fn(selector).first
+        try:
+            if not await maybe_await(loc.is_visible()):
+                return False
+        except Exception:
+            return False
+
+        try:
+            await maybe_await(loc.scroll_into_view_if_needed(timeout=2000))
+        except Exception:
+            pass
+
+        # Click button to open dropdown
+        try:
+            await maybe_await(loc.click(timeout=2000))
+        except Exception:
+            return False
+        await _asyncio.sleep(0.4)
+
+        # Read options (Workday uses [data-automation-id='promptOption'])
+        option_texts, option_locs = await self._read_dropdown_options(page)
+        logger.debug("    workday_dropdown: found %d options after click-open", len(option_texts))
+
+        if not option_texts or not option_locs:
+            return False
+
+        # Fuzzy match
+        best_idx, best_score = self._best_option_match(answer, option_texts)
+        if best_idx < 0 and len(option_texts) == 1:
+            best_idx, best_score = 0, 1
+        if best_idx >= 0:
+            try:
+                await maybe_await(option_locs[best_idx].click(timeout=2000))
+                logger.debug("    workday_dropdown: clicked '%s' (score=%d)", option_texts[best_idx][:40], best_score)
+                return True
+            except Exception:
+                pass
+        else:
+            # LLM fallback
+            qa = getattr(ctx, "question_answerer", None) if ctx else None
+            if qa is not None:
+                pick_fn = getattr(qa, "pick_option", None)
+                if pick_fn:
+                    try:
+                        llm_idx = pick_fn(question_label=label, intended_answer=answer, options=option_texts)
+                        if llm_idx is not None and 0 <= llm_idx < len(option_locs):
+                            await maybe_await(option_locs[llm_idx].click(timeout=2000))
+                            return True
+                    except Exception:
+                        pass
+
+        # Close the dropdown if nothing matched
+        keyboard_obj = getattr(page, "keyboard", None)
+        press_fn = getattr(keyboard_obj, "press", None) if keyboard_obj else None
+        if press_fn:
+            try:
+                await maybe_await(press_fn("Escape"))
+            except Exception:
+                pass
+        return False
+
+    async def _proto_react_select(self, page: Any, answer: str, ctrl: dict, *, ctx: Any = None) -> bool:
+        """React-select: click, ArrowDown to open, read .select__option, type-to-filter if needed."""
+        import asyncio as _asyncio
+        selector = str(ctrl.get("selector") or "").strip()
+        label = str(ctrl.get("label") or "").strip()
+        locator_fn = getattr(page, "locator", None)
+        keyboard_obj = getattr(page, "keyboard", None)
+        if not locator_fn or not selector:
+            return False
+
+        loc = locator_fn(selector).first
+        try:
+            if not await maybe_await(loc.is_visible()):
+                return False
+        except Exception:
+            return False
+
+        try:
+            await maybe_await(loc.scroll_into_view_if_needed(timeout=2000))
+        except Exception:
+            pass
+
+        press_fn = getattr(keyboard_obj, "press", None) if keyboard_obj else None
+        type_fn = getattr(keyboard_obj, "type", None) if keyboard_obj else None
+
+        # Click and press ArrowDown to open (react-select pattern)
+        try:
+            await maybe_await(loc.click(timeout=2000))
+        except Exception:
+            return False
+        if press_fn:
+            try:
+                await maybe_await(press_fn("ArrowDown"))
+            except Exception:
+                pass
+        await _asyncio.sleep(0.4)
+
+        # Read options
+        option_texts, option_locs = await self._read_dropdown_options(page)
+        logger.debug("    react_select: found %d options after click-open", len(option_texts))
+
+        # Type to filter if too many or zero
+        if len(option_texts) >= 25 or len(option_texts) == 0:
+            option_texts, option_locs = await self._type_to_filter_dropdown(
+                page, loc, answer, press_fn, type_fn
+            )
+
+        # Fuzzy match and click
+        if option_texts and option_locs:
+            best_idx, best_score = self._best_option_match(answer, option_texts)
+            if best_idx < 0 and len(option_texts) == 1:
+                best_idx, best_score = 0, 1
+            if best_idx >= 0:
+                try:
+                    await maybe_await(option_locs[best_idx].click(timeout=2000))
+                    logger.debug("    react_select: clicked '%s' (score=%d)", option_texts[best_idx][:40], best_score)
+                    return True
+                except Exception:
+                    pass
+            else:
+                # LLM fallback
+                qa = getattr(ctx, "question_answerer", None) if ctx else None
+                if qa is not None:
+                    pick_fn = getattr(qa, "pick_option", None)
+                    if pick_fn:
+                        try:
+                            llm_idx = pick_fn(question_label=label, intended_answer=answer, options=option_texts)
+                            if llm_idx is not None and 0 <= llm_idx < len(option_locs):
+                                await maybe_await(option_locs[llm_idx].click(timeout=2000))
+                                return True
+                        except Exception:
+                            pass
+
+        # Last resort: type + Tab
+        return await self._type_and_tab_fallback(page, loc, answer, press_fn, type_fn)
+
+    # --- Shared helpers for protocols ---
+
+    @staticmethod
+    def _match_radio_option(answer: str, radio_options: list[dict]) -> dict | None:
+        """Fuzzy-match an answer against radio option labels/values. Returns best match or None."""
+        ans_norm = normalize_text(answer)
+        best_opt = None
+        best_score = -1
+
+        for opt in radio_options:
+            opt_value = normalize_text(opt.get("value") or "")
+            if opt_value and ans_norm == opt_value:
+                return opt  # exact value match
+
+            opt_label = normalize_text(opt.get("label") or opt.get("value") or "")
+            if not opt_label:
+                continue
+            if ans_norm == opt_label:
+                return opt  # exact label match
+
+            # Last token match (avoids matching question text containing both "yes" and "no")
+            label_tokens = opt_label.split()
+            last_token = label_tokens[-1] if label_tokens else ""
+            if last_token and ans_norm == last_token:
+                score = 5000
+                if score > best_score:
+                    best_opt = opt
+                    best_score = score
+                continue
+
+            if ans_norm in opt_label or opt_label in ans_norm:
+                score = len(ans_norm)
+                if score > best_score:
+                    best_opt = opt
+                    best_score = score
+
+        return best_opt
+
+    async def _type_to_filter_dropdown(
+        self, page: Any, loc: Any, answer: str, press_fn: Any, type_fn: Any
+    ) -> tuple[list[str], list[Any]]:
+        """Type progressively shorter prefixes to filter dropdown options. Returns (texts, locs)."""
+        import asyncio as _asyncio
+        # Close any open dropdown first
+        if press_fn:
+            try:
+                await maybe_await(press_fn("Escape"))
+            except Exception:
+                pass
+            await _asyncio.sleep(0.1)
+
+        words = answer.replace(",", " ").split()
+        filter_attempts = [answer]
+        for end in range(len(words) - 1, 1, -1):
+            prefix = " ".join(words[:end])
+            if prefix != answer:
+                filter_attempts.append(prefix)
+        if len(words) >= 1 and len(words[0]) >= 3 and words[0] != answer:
+            filter_attempts.append(words[0])
+
+        for attempt in filter_attempts:
+            try:
+                await maybe_await(loc.click(timeout=2000))
+            except Exception:
+                pass
+            if press_fn:
+                for key in ("Control+A", "Meta+A", "Backspace"):
+                    try:
+                        await maybe_await(press_fn(key))
+                    except Exception:
+                        pass
+            if type_fn and attempt:
+                try:
+                    await maybe_await(type_fn(attempt, delay=30))
+                except Exception:
+                    pass
+            await _asyncio.sleep(0.6)
+
+            option_texts, option_locs = await self._read_dropdown_options(page)
+            logger.debug("    filter '%s': found %d options", attempt[:30], len(option_texts))
+            if option_texts:
+                return (option_texts, option_locs)
+
+        return ([], [])
+
+    async def _type_and_tab_fallback(
+        self, page: Any, loc: Any, answer: str, press_fn: Any, type_fn: Any
+    ) -> bool:
+        """Last-resort: close dropdown, type the answer, press Tab."""
+        import asyncio as _asyncio
+        logger.debug("    fallback: type+Tab for '%s'", answer[:30])
+        if press_fn:
+            try:
+                await maybe_await(press_fn("Escape"))
+            except Exception:
+                pass
+            await _asyncio.sleep(0.1)
+        try:
+            await maybe_await(loc.click(timeout=2000))
+        except Exception:
+            pass
+        if press_fn:
+            for key in ("Control+A", "Meta+A", "Backspace"):
+                try:
+                    await maybe_await(press_fn(key))
+                except Exception:
+                    pass
+        if type_fn and answer:
+            try:
+                await maybe_await(type_fn(answer, delay=20))
+            except Exception:
+                pass
+        if press_fn:
+            try:
+                await maybe_await(press_fn("Tab"))
+            except Exception:
+                pass
+        return True
+
+    async def _read_dropdown_options(self, page: Any) -> tuple[list[str], list[Any]]:
+        """Read all visible dropdown/listbox options. Returns (texts, locators)."""
+        locator_fn = getattr(page, "locator", None)
+        if not locator_fn:
+            return ([], [])
+
+        selectors = [
+            "[role='listbox']:visible [role='option']",
+            ".select__menu:visible [role='option']",
+            ".select__menu:visible .select__option",
+            "[data-automation-id='promptOption']",
+            ".autocomplete-results:visible li",
+            ".pac-container:visible .pac-item",
+            "ul[role='listbox']:visible li",
+        ]
+
+        for sel in selectors:
+            try:
+                opts_loc = locator_fn(sel)
+                count = await maybe_await(opts_loc.count())
+                if count and count > 0:
+                    texts = []
+                    locs = []
+                    for idx in range(min(int(count), 30)):
+                        opt = opts_loc.nth(idx)
+                        try:
+                            vis = await maybe_await(opt.is_visible())
+                            if not vis:
+                                continue
+                        except Exception:
+                            continue
+                        try:
+                            txt = str(await maybe_await(opt.inner_text()) or "").strip()
+                        except Exception:
+                            txt = ""
+                        if txt:
+                            texts.append(txt)
+                            locs.append(opt)
+                    if texts:
+                        return (texts, locs)
+            except Exception:
+                continue
+
+        return ([], [])
 
     @staticmethod
     def _best_option_match(answer: str, options: list[str]) -> tuple[int, int]:
@@ -3450,552 +2397,6 @@ class BaseATSHandler:
                 best_idx = idx
 
         return (best_idx, best_score)
-
-    async def _fill_select_dropdown(self, page: Any, selector: str, answer: str, options: list[str]) -> bool:
-        """Native <select> element: use Playwright's select_option with best-match label."""
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn or not selector:
-            return False
-
-        best_idx, best_score = self._best_option_match(answer, options)
-
-        if best_idx < 0:
-            logger.debug("    select: no matching option for '%s' in %s", answer[:30], [o[:20] for o in options[:5]])
-            return False
-
-        best_opt = options[best_idx]
-        loc = locator_fn(selector).first
-        try:
-            await maybe_await(loc.select_option(label=best_opt, timeout=3000))
-            logger.debug("    select: picked '%s' (score=%d)", best_opt[:40], best_score)
-            return True
-        except Exception:
-            try:
-                await maybe_await(loc.select_option(value=best_opt, timeout=2000))
-                return True
-            except Exception:
-                return False
-
-    async def _fill_combobox_dropdown(self, page: Any, selector: str, answer: str, label: str, *, question_answerer: Any = None) -> bool:
-        """
-        Combobox / react-select / autocomplete.
-
-        Strategy (DROPDOWN-FIRST):
-        1. Click to open the dropdown.
-        2. Read ALL visible options.
-        3. Pick the best fuzzy match.
-        4. If no fuzzy match, ask the LLM to pick from the actual options.
-        5. Click it.
-        6. Only if there are 0 options or >=25 (huge list), type to filter first.
-        """
-        locator_fn = getattr(page, "locator", None)
-        keyboard_obj = getattr(page, "keyboard", None)
-        if not locator_fn or not selector:
-            return False
-
-        import asyncio as _asyncio
-
-        loc = locator_fn(selector).first
-        try:
-            if not await maybe_await(loc.is_visible()):
-                return False
-        except Exception:
-            return False
-
-        try:
-            await maybe_await(loc.scroll_into_view_if_needed(timeout=2000))
-        except Exception:
-            pass
-
-        press_fn = getattr(keyboard_obj, "press", None) if keyboard_obj else None
-        type_fn = getattr(keyboard_obj, "type", None) if keyboard_obj else None
-
-        # --- Phase 1: Click to open dropdown ---
-        try:
-            await maybe_await(loc.click(timeout=2000))
-        except Exception:
-            return False
-
-        # Press ArrowDown to ensure the dropdown opens (react-select pattern)
-        if press_fn:
-            try:
-                await maybe_await(press_fn("ArrowDown"))
-            except Exception:
-                pass
-
-        await _asyncio.sleep(0.4)
-
-        # --- Phase 2: Read ALL options ---
-        option_texts, option_locs = await self._read_dropdown_options(page)
-        logger.debug("    combobox phase1: found %d options after click-open", len(option_texts))
-
-        # --- Phase 3: If too many options (>=25, close to our 30-cap) or 0 options, type to filter ---
-        if len(option_texts) >= 25 or len(option_texts) == 0:
-            logger.debug("    combobox: typing to filter (%d raw options)", len(option_texts))
-            # Close any open dropdown first
-            if press_fn:
-                try:
-                    await maybe_await(press_fn("Escape"))
-                except Exception:
-                    pass
-                await _asyncio.sleep(0.1)
-
-            # Build filter attempts: full answer, then progressively shorter word prefixes
-            words = answer.replace(",", " ").split()
-            filter_attempts = [answer]
-            # Add progressively shorter prefixes (at least 2 words)
-            for end in range(len(words) - 1, 1, -1):
-                prefix = " ".join(words[:end])
-                if prefix != answer:
-                    filter_attempts.append(prefix)
-            # Also try just the first word if it's long enough
-            if len(words) >= 1 and len(words[0]) >= 3 and words[0] != answer:
-                filter_attempts.append(words[0])
-
-            for attempt in filter_attempts:
-                # Re-click, clear, and type this attempt
-                try:
-                    await maybe_await(loc.click(timeout=2000))
-                except Exception:
-                    pass
-                if press_fn:
-                    for key in ("Control+A", "Meta+A", "Backspace"):
-                        try:
-                            await maybe_await(press_fn(key))
-                        except Exception:
-                            pass
-                if type_fn and attempt:
-                    try:
-                        await maybe_await(type_fn(attempt, delay=30))
-                    except Exception:
-                        pass
-                await _asyncio.sleep(0.6)
-
-                option_texts, option_locs = await self._read_dropdown_options(page)
-                logger.debug("    combobox filter '%s': found %d options", attempt[:30], len(option_texts))
-
-                if option_texts:
-                    break  # Found some options, proceed to Phase 4
-
-        # --- Phase 4: Pick best match and click ---
-        if option_texts and option_locs:
-            best_idx, best_score = self._best_option_match(answer, option_texts)
-
-            # If no good match but only 1 option, take it
-            if best_idx < 0 and len(option_texts) == 1:
-                best_idx = 0
-                best_score = 1
-
-            if best_idx >= 0:
-                try:
-                    await maybe_await(option_locs[best_idx].click(timeout=2000))
-                    logger.debug("    combobox: clicked '%s' (score=%d, of %d opts)",
-                                 option_texts[best_idx][:40], best_score, len(option_texts))
-                    return True
-                except Exception:
-                    logger.debug("    combobox: click failed on option %d", best_idx, exc_info=True)
-            else:
-                # --- Phase 4b: LLM fallback — ask the LLM to pick from actual options ---
-                logger.debug("    combobox: no fuzzy match for '%s' in %d options: %s",
-                             answer[:30], len(option_texts),
-                             [o[:25] for o in option_texts[:5]])
-                if question_answerer is not None:
-                    pick_fn = getattr(question_answerer, "pick_option", None)
-                    if pick_fn:
-                        logger.info("    combobox: asking LLM to pick from %d options for '%s'",
-                                    len(option_texts), label[:40])
-                        try:
-                            llm_idx = pick_fn(
-                                question_label=label,
-                                intended_answer=answer,
-                                options=option_texts,
-                            )
-                            if llm_idx is not None and 0 <= llm_idx < len(option_locs):
-                                await maybe_await(option_locs[llm_idx].click(timeout=2000))
-                                logger.debug("    combobox: LLM picked '%s' (#%d of %d)",
-                                             option_texts[llm_idx][:40], llm_idx, len(option_texts))
-                                return True
-                        except Exception:
-                            logger.debug("    combobox: LLM pick failed", exc_info=True)
-
-        # --- Phase 5: Last resort — type and Tab/Enter ---
-        logger.debug("    combobox: falling back to type+Tab for '%s'", answer[:30])
-        if press_fn:
-            try:
-                await maybe_await(press_fn("Escape"))
-            except Exception:
-                pass
-            await _asyncio.sleep(0.1)
-        try:
-            await maybe_await(loc.click(timeout=2000))
-        except Exception:
-            pass
-        if press_fn:
-            for key in ("Control+A", "Meta+A", "Backspace"):
-                try:
-                    await maybe_await(press_fn(key))
-                except Exception:
-                    pass
-        if type_fn and answer:
-            try:
-                await maybe_await(type_fn(answer, delay=20))
-            except Exception:
-                pass
-        if press_fn:
-            try:
-                await maybe_await(press_fn("Tab"))
-            except Exception:
-                pass
-        return True
-
-    async def _read_dropdown_options(self, page: Any) -> tuple[list[str], list[Any]]:
-        """Read all visible dropdown/listbox options. Returns (texts, locators)."""
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn:
-            return ([], [])
-
-        # Try several common dropdown selectors
-        selectors = [
-            "[role='listbox'] [role='option']",
-            ".select__menu [role='option']",
-            ".select__menu .select__option",
-            "[data-automation-id='promptOption']",
-            ".autocomplete-results li",
-            ".pac-container .pac-item",
-            "ul[role='listbox'] li",
-        ]
-
-        for sel in selectors:
-            try:
-                opts_loc = locator_fn(sel)
-                count = await maybe_await(opts_loc.count())
-                if count and count > 0:
-                    texts = []
-                    locs = []
-                    for idx in range(min(int(count), 30)):
-                        opt = opts_loc.nth(idx)
-                        try:
-                            vis = await maybe_await(opt.is_visible())
-                            if not vis:
-                                continue
-                        except Exception:
-                            continue
-                        try:
-                            txt = str(await maybe_await(opt.inner_text()) or "").strip()
-                        except Exception:
-                            txt = ""
-                        if txt:
-                            texts.append(txt)
-                            locs.append(opt)
-                    if texts:
-                        return (texts, locs)
-            except Exception:
-                continue
-
-        return ([], [])
-
-    async def _check_checkbox(self, page: Any, selector: str) -> bool:
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn or not selector:
-            return False
-        try:
-            loc = locator_fn(selector).first
-            check_fn = getattr(loc, "check", None)
-            if check_fn:
-                await maybe_await(check_fn(timeout=2000))
-            else:
-                await maybe_await(loc.click(timeout=2000))
-            return True
-        except Exception:
-            return False
-
-    async def _fill_radio_group(self, page: Any, answer: str, radio_options: list[dict]) -> bool:
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn or not radio_options:
-            return False
-
-        ans_norm = normalize_text(answer)
-        best_opt = None
-        best_score = -1
-        for opt in radio_options:
-            opt_label = normalize_text(opt.get("label") or opt.get("value") or "")
-            if not opt_label:
-                continue
-            if ans_norm == opt_label:
-                best_opt = opt
-                best_score = 10000
-                break
-            if ans_norm in opt_label or opt_label in ans_norm:
-                score = len(ans_norm)
-                if score > best_score:
-                    best_opt = opt
-                    best_score = score
-
-        if best_opt is None:
-            return False
-
-        sel = str(best_opt.get("selector") or "").strip()
-        if not sel:
-            return False
-        try:
-            loc = locator_fn(sel).first
-            check_fn = getattr(loc, "check", None)
-            if check_fn:
-                await maybe_await(check_fn(timeout=2000))
-            else:
-                await maybe_await(loc.click(timeout=2000))
-            return True
-        except Exception:
-            return False
-
-    async def _fill_text_field(self, page: Any, selector: str, answer: str) -> bool:
-        locator_fn = getattr(page, "locator", None)
-        if not locator_fn or not selector:
-            return False
-        try:
-            loc = locator_fn(selector).first
-            # Double-check it's still empty
-            try:
-                current = str(await maybe_await(loc.input_value()) or "").strip()
-            except Exception:
-                try:
-                    current = str(await maybe_await(loc.inner_text()) or "").strip()
-                except Exception:
-                    current = ""
-            if current:
-                logger.debug("    text: already has value '%s', skipping.", current[:30])
-                return False
-            await maybe_await(loc.fill(answer, timeout=3000))
-            return True
-        except Exception:
-            return False
-
-    async def _fill_autocomplete_input(
-        self, page: Any, selector: str, answer: str
-    ) -> bool:
-        """
-        Handle autocomplete/combobox text inputs (e.g. Greenhouse's Location, dropdown questions).
-
-        Strategy: click the input, clear it, type slowly to trigger autocomplete,
-        wait for a dropdown to appear, and click the best-matching option.
-        Falls back to just typing + pressing Enter if no dropdown appears.
-        """
-        locator_fn = getattr(page, "locator", None)
-        keyboard = getattr(page, "keyboard", None)
-        if locator_fn is None or keyboard is None:
-            return False
-
-        try:
-            loc = locator_fn(selector)
-            if await maybe_await(loc.count()) <= 0:
-                return False
-            first = loc.first
-            if not await maybe_await(first.is_visible()):
-                return False
-
-            # Check if the element is an interactive input (not hidden checkbox, etc.)
-            tag = str(await maybe_await(first.evaluate("el => el.tagName")) or "").lower()
-            input_type = str(
-                await maybe_await(first.get_attribute("type")) or ""
-            ).strip().lower()
-            if tag != "input" or input_type in ("checkbox", "radio", "hidden", "file"):
-                return False
-
-            # Click to focus and open any autocomplete
-            try:
-                await maybe_await(first.scroll_into_view_if_needed(timeout=2000))
-            except Exception:
-                pass
-            await maybe_await(first.click(timeout=2000))
-
-            # Clear existing value
-            press_fn = getattr(keyboard, "press", None)
-            type_fn = getattr(keyboard, "type", None)
-            if press_fn:
-                try:
-                    await maybe_await(press_fn("Meta+A"))
-                except Exception:
-                    pass
-                try:
-                    await maybe_await(press_fn("Control+A"))
-                except Exception:
-                    pass
-                try:
-                    await maybe_await(press_fn("Backspace"))
-                except Exception:
-                    pass
-
-            # Type slowly to trigger autocomplete dropdown
-            if type_fn and len(answer) <= 200:
-                await maybe_await(type_fn(answer, delay=30))
-            else:
-                await maybe_await(first.fill(answer, timeout=2000))
-
-            # Wait a bit for autocomplete dropdown to appear
-            import asyncio as _asyncio
-            await _asyncio.sleep(0.5)
-
-            # Look for autocomplete dropdown options
-            dropdown_clicked = False
-            dropdown_selectors = [
-                "[role='listbox'] [role='option']",
-                ".autocomplete-results li",
-                ".suggestions li",
-                ".pac-container .pac-item",  # Google Places autocomplete
-                "[class*='dropdown'] [class*='option']",
-                "[class*='suggestion']",
-                "[class*='result'] li",
-            ]
-
-            ans_norm = normalize_text(answer)
-            ans_tokens = [t for t in ans_norm.split() if len(t) >= 3]
-
-            for dd_sel in dropdown_selectors:
-                try:
-                    options_loc = locator_fn(dd_sel)
-                    await maybe_await(options_loc.first.wait_for(state="visible", timeout=800))
-                    option_count = await maybe_await(options_loc.count())
-                    if option_count > 0:
-                        # Find best matching option
-                        best_idx = 0
-                        best_score = 0
-                        for idx in range(min(int(option_count), 20)):
-                            try:
-                                txt = str(await maybe_await(options_loc.nth(idx).inner_text()) or "")
-                                opt_norm = normalize_text(txt)
-                                if not opt_norm:
-                                    continue
-                                score = 0
-                                if ans_norm in opt_norm:
-                                    score += 200 + len(ans_norm)
-                                elif opt_norm in ans_norm:
-                                    score += 150 + len(opt_norm)
-                                else:
-                                    for tok in ans_tokens:
-                                        if tok in opt_norm:
-                                            score += 10
-                                if score > best_score:
-                                    best_score = score
-                                    best_idx = idx
-                            except Exception:
-                                continue
-
-                        if best_score > 0 or option_count == 1:
-                            try:
-                                await maybe_await(options_loc.nth(best_idx).click(timeout=2000))
-                                dropdown_clicked = True
-                                logger.debug("  Autocomplete: clicked option %d (score=%d).", best_idx, best_score)
-                                break
-                            except Exception:
-                                pass
-                except Exception:
-                    continue
-
-            # If no dropdown appeared, try pressing Enter to confirm the typed value
-            if not dropdown_clicked and press_fn:
-                try:
-                    await maybe_await(press_fn("Enter"))
-                except Exception:
-                    pass
-                # Also try Tab to move focus (some forms validate on blur)
-                try:
-                    await maybe_await(press_fn("Tab"))
-                except Exception:
-                    pass
-
-            return True
-        except Exception:
-            return False
-
-    async def _extract_custom_question_candidates(self, page: Any, limit: int = 5) -> list[dict[str, str]]:
-        evaluate_fn = getattr(page, "evaluate", None)
-        if evaluate_fn is None:
-            return []
-
-        script = """
-        (limit) => {
-          const standardHints = [
-            "first name", "last name", "email", "phone", "linkedin", "github",
-            "school", "university", "degree", "gpa", "graduation", "resume", "cv",
-            "work authorization", "sponsorship", "relocate", "start date", "salary"
-          ];
-
-          const normalize = (v) => (v || "").toLowerCase().replace(/\\s+/g, " ").trim();
-
-          function selectorFor(el) {
-            if (!el) return "";
-            const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(String(v || "")) : String(v || "");
-            if (el.id) return "#" + esc(el.id);
-            const name = el.getAttribute("name");
-            if (name) return `${el.tagName.toLowerCase()}[name="${esc(name)}"]`;
-
-            const parts = [];
-            let cur = el;
-            for (let i = 0; i < 5 && cur && cur.nodeType === 1; i += 1) {
-              const tag = cur.tagName.toLowerCase();
-              let index = 1;
-              let sib = cur.previousElementSibling;
-              while (sib) {
-                if (sib.tagName === cur.tagName) index += 1;
-                sib = sib.previousElementSibling;
-              }
-              parts.unshift(`${tag}:nth-of-type(${index})`);
-              cur = cur.parentElement;
-            }
-            return parts.join(" > ");
-          }
-
-          function questionFor(el) {
-            const id = el.id;
-            if (id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-              if (byFor?.innerText) return byFor.innerText;
-            }
-            const wrapLabel = el.closest("label");
-            if (wrapLabel?.innerText) return wrapLabel.innerText;
-            let root = el.closest("fieldset,section,div,li,tr,td,dd,form");
-            while (root) {
-              const labelLike = root.querySelector("label,legend,h3,p,strong");
-              if (labelLike?.innerText) return labelLike.innerText;
-              root = root.parentElement;
-            }
-            return el.placeholder || el.name || "";
-          }
-
-          const candidates = [];
-          const inputs = Array.from(document.querySelectorAll("textarea, input[type='text'], input[type='url'], input:not([type])"));
-          for (const el of inputs) {
-            if (candidates.length >= limit) break;
-            if (el.disabled || el.readOnly) continue;
-            if ((el.value || "").trim()) continue;
-
-            const q = normalize(questionFor(el));
-            if (!q || q.length < 12) continue;
-            if (standardHints.some((hint) => q.includes(hint))) continue;
-
-            candidates.push({
-              question: questionFor(el).trim().slice(0, 700),
-              selector: selectorFor(el),
-            });
-          }
-          return candidates;
-        }
-        """
-        try:
-            result = await maybe_await(evaluate_fn(script, limit))
-            if isinstance(result, list):
-                normalized: list[dict[str, str]] = []
-                for item in result:
-                    if not isinstance(item, dict):
-                        continue
-                    q = str(item.get("question") or "").strip()
-                    s = str(item.get("selector") or "").strip()
-                    if q:
-                        normalized.append({"question": q, "selector": s})
-                return normalized
-        except Exception:
-            return []
-        return []
 
     async def _advance_multi_page_if_needed(self, page: Any, max_steps: int = 2) -> None:
         for _ in range(max_steps):
@@ -4042,6 +2443,76 @@ class BaseATSHandler:
         except Exception:
             return {"detected": False}
         return {"detected": False}
+
+    async def _page_signature(self, page: Any) -> str:
+        """Return a lightweight fingerprint of the current page's visible form controls.
+        Used to detect when clicking Next didn't actually advance the page."""
+        evaluate_fn = getattr(page, "evaluate", None)
+        if evaluate_fn is None:
+            return ""
+        try:
+            sig = await maybe_await(evaluate_fn("""
+                () => {
+                    const els = document.querySelectorAll(
+                        'input:not([type="hidden"]), select, textarea, ' +
+                        '[role="combobox"], [role="radio"], [role="checkbox"], ' +
+                        '[data-automation-id]'
+                    );
+                    const ids = [];
+                    for (const el of els) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 2 || rect.height < 2) continue;
+                        ids.push(el.id || el.name || el.getAttribute('data-automation-id') || el.tagName);
+                    }
+                    // Sort for stability — DOM order can vary
+                    ids.sort();
+                    return ids.join('|');
+                }
+            """))
+            return str(sig or "")
+        except Exception:
+            return ""
+
+    async def _wait_for_page_ready(self, page: Any, *, timeout_sec: float = 3.0) -> bool:
+        """
+        Base-class page-ready gate. Waits for:
+          1. At least one form control is visible
+          2. No network activity / loading state
+
+        ATS subclasses (e.g. Workday) override this with more specific checks.
+        Returns True if the page appears ready, False on timeout.
+        """
+        import asyncio as _asyncio
+        import time
+
+        evaluate_fn = getattr(page, "evaluate", None)
+        if evaluate_fn is None:
+            await _asyncio.sleep(1.5)
+            return True
+
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            await _asyncio.sleep(0.4)
+            try:
+                count = await maybe_await(evaluate_fn("""
+                    () => {
+                        const els = document.querySelectorAll(
+                            'input:not([type="hidden"]), select, textarea'
+                        );
+                        let n = 0;
+                        for (const el of els) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width >= 2 && rect.height >= 2) n++;
+                        }
+                        return n;
+                    }
+                """))
+                if int(count or 0) > 0:
+                    return True
+            except Exception:
+                pass
+
+        return False
 
     async def _submit(self, page: Any) -> bool:
         for prompt in self.submit_prompts:
