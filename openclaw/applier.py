@@ -101,38 +101,6 @@ def _infer_default_memory_root() -> str:
     return str(ec2_default)
 
 
-def _bootstrap_local_venv_site_packages() -> bool:
-    """
-    Local dev convenience: if the user runs `python3 -m openclaw.applier` without activating
-    the repo's `.venv`, attempt to add that venv's site-packages to sys.path so optional
-    deps (ex: skyvern) can be imported.
-
-    This is a best-effort helper and is a no-op on EC2 where `.venv` usually doesn't exist.
-    """
-    repo_root = Path(__file__).resolve().parents[1]
-    venv = repo_root / ".venv"
-    if not venv.exists():
-        return False
-
-    major = sys.version_info.major
-    minor = sys.version_info.minor
-    candidates = [
-        venv / "lib" / f"python{major}.{minor}" / "site-packages",  # macOS/Linux
-        venv / "Lib" / "site-packages",  # Windows
-    ]
-    for site_packages in candidates:
-        try:
-            if not site_packages.exists():
-                continue
-            sp = str(site_packages)
-            if sp not in sys.path:
-                sys.path.insert(0, sp)
-            return True
-        except Exception:
-            continue
-    return False
-
-
 @dataclass(slots=True)
 class BrowserSession:
     page: Any
@@ -150,46 +118,7 @@ class BrowserSession:
 
 
 async def launch_browser_session(headless: bool = True) -> BrowserSession:
-    # Default to Playwright for a fully local, key-free setup.
-    return await launch_browser_session_with_engine(headless=headless, engine="playwright")
-
-
-def _read_dotenv_value(dotenv_path: Path, key: str) -> str | None:
-    """
-    Minimal .env parser to avoid adding a hard dependency on python-dotenv in the applier.
-    Supports: KEY=VALUE, optional quotes, ignores comments/blank lines.
-    """
-    try:
-        raw = dotenv_path.read_text(encoding="utf-8")
-    except Exception:
-        return None
-
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        if k.strip() != key:
-            continue
-        value = v.strip().strip('"').strip("'")
-        return value or None
-    return None
-
-
-def _resolve_skyvern_api_key() -> str | None:
-    key = (os.getenv("SKYVERN_API_KEY") or os.getenv("OPENCLAW_SKYVERN_API_KEY") or "").strip()
-    if key:
-        return key
-
-    # Common local setup: a repo .env (or a user drops one in cwd).
-    for p in (Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env"):
-        if p.exists():
-            v = _read_dotenv_value(p, "SKYVERN_API_KEY")
-            if v:
-                return v.strip()
-    return None
+    return await launch_browser_session_with_engine(headless=headless)
 
 
 def _pick_free_local_port() -> int:
@@ -204,67 +133,14 @@ def _pick_free_local_port() -> int:
             pass
 
 
-async def launch_browser_session_with_engine(headless: bool = True, *, engine: str = "auto") -> BrowserSession:
-    skyvern_error: Exception | None = None
-    engine = (engine or "auto").strip().lower()
-    if engine not in ("auto", "skyvern", "playwright"):
-        raise ValueError("engine must be one of: auto, skyvern, playwright")
-
-    if engine in ("auto", "skyvern"):
-        api_key = _resolve_skyvern_api_key()
-        if not api_key:
-            skyvern_error = RuntimeError(
-                "SKYVERN_API_KEY is not set (and no .env containing it was found). "
-                "Set SKYVERN_API_KEY to use Skyvern."
-            )
-            if engine == "skyvern":
-                raise skyvern_error
-        else:
-            try:
-                try:
-                    from skyvern import Skyvern  # type: ignore
-                except ModuleNotFoundError:
-                    if _bootstrap_local_venv_site_packages():
-                        logger.debug("Bootstrapped .venv site-packages into sys.path for Skyvern import.")
-                        from skyvern import Skyvern  # type: ignore
-                    else:
-                        raise
-
-                # Prefer Skyvern Cloud client (no `skyvern quickstart` / local embedded server required).
-                skyvern = Skyvern(api_key=api_key)
-
-                # Local browser keeps HITL ergonomic (--headful shows an actual browser window).
-                browser = await skyvern.launch_local_browser(headless=headless)
-                page = await browser.get_working_page()
-                _configure_page_timeouts(page)
-
-                async def _close_skyvern() -> None:
-                    try:
-                        close_fn = getattr(browser, "close", None)
-                        if close_fn:
-                            await maybe_await(close_fn())
-                    finally:
-                        aclose_fn = getattr(skyvern, "aclose", None)
-                        if aclose_fn:
-                            await maybe_await(aclose_fn())
-
-                return BrowserSession(page=page, engine="skyvern", _closer=_close_skyvern)
-            except Exception as exc:
-                skyvern_error = exc
-                if engine == "skyvern":
-                    raise
-                logger.debug("Skyvern launch failed; falling back to Playwright: %s", exc)
-
+async def launch_browser_session_with_engine(headless: bool = True) -> BrowserSession:
     try:
         from playwright.async_api import async_playwright  # type: ignore
     except Exception as playwright_import_error:
-        msg = [
-            "Unable to launch automation browser.",
-            f"Skyvern error: {skyvern_error}",
-            f"Playwright import error: {playwright_import_error}",
-            "Install with: pip install skyvern playwright && playwright install chromium",
-        ]
-        raise RuntimeError(" | ".join(msg)) from playwright_import_error
+        raise RuntimeError(
+            f"Unable to launch automation browser. Playwright import error: {playwright_import_error}. "
+            "Install with: pip install playwright && playwright install chromium"
+        ) from playwright_import_error
 
     playwright = await async_playwright().start()
     cdp_url: str | None = None
@@ -339,7 +215,6 @@ async def run_single_application(
     keep_open: bool = False,
     session: BrowserSession | None = None,
     headless: bool = True,
-    engine: str = "playwright",
 ) -> dict[str, Any]:
     output_dir = create_run_dir(memory_root, company)
     screenshots: list[str] = []
@@ -351,11 +226,10 @@ async def run_single_application(
     handoff_payload: dict[str, Any] | None = None
     try:
         if session is None:
-            session = await launch_browser_session_with_engine(headless=headless, engine=engine)
+            session = await launch_browser_session_with_engine(headless=headless)
         logger.info(
-            "Applying via %s handler using %s browser engine: %s | %s",
+            "Applying via %s handler (Playwright): %s | %s",
             handler.ats_name,
-            session.engine,
             company,
             role,
         )
@@ -587,18 +461,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path containing profile.json/resume.json/resume.pdf",
     )
     parser.add_argument(
-        "--engine",
-        choices=["auto", "skyvern", "playwright"],
-        default="playwright",
-        help=(
-            "Browser engine. 'playwright' is fully local. "
-            "'auto' uses Skyvern when SKYVERN_API_KEY is set (otherwise Playwright). "
-            "'skyvern' requires SKYVERN_API_KEY and disables fallback. "
-            "'playwright' skips Skyvern."
-        ),
-    )
-
-    parser.add_argument(
         "--source",
         choices=["simplify"],
         help="Fetch jobs from an integrated source instead of a single URL",
@@ -817,7 +679,7 @@ async def run_source_harvest(args: argparse.Namespace, memory_root: Path) -> dic
         headless = False
 
     session: BrowserSession | None = None
-    session = await launch_browser_session_with_engine(headless=headless, engine=args.engine)
+    session = await launch_browser_session_with_engine(headless=headless)
 
     harvested: list[HarvestedField] = []
     jobs_sampled: list[dict[str, str]] = []
@@ -891,7 +753,7 @@ async def run_direct_harvest(args: argparse.Namespace, memory_root: Path) -> dic
     role = args.role or "Unknown"
     job_url = str(args.job_url)
 
-    session = await launch_browser_session_with_engine(headless=headless, engine=args.engine)
+    session = await launch_browser_session_with_engine(headless=headless)
     harvested: list[HarvestedField] = []
     errors: list[dict[str, str]] = []
     try:
@@ -993,7 +855,7 @@ async def run_source_mode(args: argparse.Namespace, memory_root: Path) -> dict[s
 
     session: BrowserSession | None = None
     if args.reuse_session:
-        session = await launch_browser_session_with_engine(headless=headless, engine=args.engine)
+        session = await launch_browser_session_with_engine(headless=headless)
 
     try:
         for role in roles:
@@ -1021,7 +883,6 @@ async def run_source_mode(args: argparse.Namespace, memory_root: Path) -> dict[s
                 keep_open=args.keep_open,
                 session=session,
                 headless=headless,
-                engine=args.engine,
             )
             result["source"] = {
                 "name": "simplify",
@@ -1079,7 +940,6 @@ async def run_direct_mode(args: argparse.Namespace, memory_root: Path) -> dict[s
         upload_tailored_resume=args.upload_tailored_resume,
         keep_open=args.keep_open,
         headless=headless,
-        engine=args.engine,
     )
 
 

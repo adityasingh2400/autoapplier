@@ -20,8 +20,6 @@ pip install playwright boto3
 playwright install chromium
 ```
 
-Skyvern is optional. If you want to use it, you'll need `SKYVERN_API_KEY` (or `OPENCLAW_SKYVERN_API_KEY`).
-
 ## Expected Memory Layout
 
 Create a **local** memory folder (e.g. `real_memory/` or `test_memory/`) with:
@@ -142,7 +140,6 @@ Useful flags:
 - `--memory-root /path/to/memory`: override default memory path
 - `-v`: verbose logging
 - `--human-in-loop`: pauses for manual steps (CAPTCHA/auth/missing required fields) when run interactively (TTY)
-- `--engine skyvern`: optional: force Skyvern (no Playwright fallback). Requires `SKYVERN_API_KEY`.
 
 ## Version control & pushing to GitHub
 
@@ -151,7 +148,7 @@ This repo is set up so you can use Git and push to GitHub without exposing perso
 1. **What’s ignored (never committed)**  
    `.gitignore` excludes:
    - `real_memory/` and `test_memory/` (profile, resume, applications, screenshots)
-   - `.env` and any env files (e.g. `SKYVERN_API_KEY`)
+   - `.env` and any env files (e.g. for local overrides)
    - `.venv/` and Python cache
    - Credentials under `~/.openclaw/` (those live outside the repo anyway)
 
