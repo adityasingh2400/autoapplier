@@ -13,6 +13,8 @@ env/
 real_memory/
 test_memory/
 memory/
+AdityaSingh_CoverLetter_LaunchDarkly.md
+AdityaSingh_Resume*.pdf
 
 # OpenClaw credentials (stored under ~/.openclaw; exclude if ever in repo)
 .openclaw/
