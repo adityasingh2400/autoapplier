@@ -1,0 +1,16 @@
+# Core HTTP / scraping
+requests>=2.32
+
+# PDF parsing (resume text extraction)
+pypdf>=6.0
+
+# PDF generation (cover letters)
+fpdf2>=2.8
+
+reportlab>=4.0
+
+# Browser automation (job applications)
+playwright>=1.50
+
+# AWS Bedrock (LLM job scoring)
+boto3>=1.42

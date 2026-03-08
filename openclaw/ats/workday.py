@@ -722,18 +722,16 @@ class WorkdayHandler(BaseATSHandler):
     def _get_snapshot_skip_labels(self) -> list[str]:
         """Labels the snapshot-and-fill should skip on Workday (handled by pre-fill).
 
-        'how did you hear' is handled by _fill_how_did_you_hear in pre-fill.
-        Snapshot-fill must NOT try to .fill() this — it's a directory picker,
-        not a text field, and typing into it does nothing useful.
+        NOTE: 'how did you hear' and 'school or university' are NOT in this list.
+        When the specialized handlers fail (e.g. different Workday layout), snapshot-fill
+        must still try via combobox/text protocol + standard fields.
         """
         return [
-            "how did you hear",
             "job title",
             "company",
             "location",
             "role description",
             "i currently work here",
-            "school or university",
             "degree",
             "field of study",
             "overall result",
@@ -958,17 +956,12 @@ class WorkdayHandler(BaseATSHandler):
                 return
             section = page.get_by_role("group", name="Education 1", exact=True)
 
-        # -- School or University (plain textbox) --
+        # -- School or University --
+        # Workday varies: (A) plain textbox — fill() works; (B) searchable picker — type, Enter, select.
+        # Use one flow that handles both: fill, Enter, if listbox appears then click option.
         school = entry.get("institution") or ""
         if school:
-            try:
-                inp = section.get_by_role("textbox", name="School or University")
-                await maybe_await(inp.scroll_into_view_if_needed(timeout=5000))
-                await maybe_await(inp.click(timeout=3000))
-                await maybe_await(inp.fill(school))
-                logger.debug("[Workday] Edu: School = '%s'", school)
-            except Exception as exc:
-                logger.debug("[Workday] Edu: School failed: %s", exc)
+            await self._fill_school_or_university(page, section, school, locator_fn)
 
         # -- Degree dropdown (button → listbox → click option) --
         # From manual mapping: the button's accessible name includes "Degree"
@@ -1170,6 +1163,98 @@ class WorkdayHandler(BaseATSHandler):
     # ------------------------------------------------------------------
     # Field of Study: search + radio single-select picker
     # ------------------------------------------------------------------
+    async def _fill_field_of_study_picker(
+        self, page: Any, section: Any, school: str, locator_fn: Any,
+    ) -> None:
+        """
+        Fill School or University. Handles both plain textbox and searchable picker.
+
+        Workday varies: (A) plain textbox — fill() is enough; (B) searchable picker —
+        type, Enter, wait for listbox, click option. We do fill + Enter; if listbox
+        appears we select, else the fill alone sufficed.
+        """
+        keyboard = getattr(page, "keyboard", None)
+        if not keyboard:
+            return
+        try:
+            # Try multiple label variants — Workday forms differ
+            for label_pattern in ["School or University", "School", "University", re.compile(r"School|University", re.I)]:
+                try:
+                    inp = section.get_by_role("textbox", name=label_pattern)
+                    if await maybe_await(inp.count()) == 0:
+                        continue
+                    inp = inp.first
+                    await maybe_await(inp.scroll_into_view_if_needed(timeout=5000))
+                    await maybe_await(inp.click(timeout=3000))
+                    await maybe_await(inp.fill(school))
+                    logger.debug("[Workday] Edu: School typed = '%s'", school)
+                    break
+                except Exception:
+                    continue
+            else:
+                logger.debug("[Workday] Edu: School textbox not found")
+                return
+
+            # If it's a searchable picker, Enter opens a listbox. Only press Enter when
+            # the input looks like a combobox (has listbox popup) — otherwise we might
+            # accidentally submit a plain text form.
+            inp_handle = await maybe_await(inp.element_handle(timeout=2000))
+            is_combobox = False
+            if inp_handle:
+                try:
+                    is_combobox = await maybe_await(page.evaluate("""
+                        (el) => {
+                            if (!el) return false;
+                            const root = el.closest('[role="combobox"], [aria-haspopup="listbox"], [aria-autocomplete="list"]');
+                            return !!root;
+                        }
+                    """, inp_handle))
+                except Exception:
+                    pass
+            if is_combobox:
+                await asyncio.sleep(0.3)
+                await maybe_await(keyboard.press("Enter"))
+                await asyncio.sleep(1.2)
+
+            options = locator_fn("[role='listbox']:visible [role='option']")
+            count = await maybe_await(options.count())
+            if count > 0:
+                target_lower = school.lower()
+                clicked = False
+                for i in range(min(count, 15)):
+                    opt = options.nth(i)
+                    try:
+                        if not await maybe_await(opt.is_visible()):
+                            continue
+                        text = (await maybe_await(opt.text_content()) or "").strip()
+                        if target_lower in text.lower() or text.lower() in target_lower:
+                            await maybe_await(opt.click(timeout=3000))
+                            logger.debug("[Workday] Edu: School selected '%s'", text)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    # Fallback: first option
+                    try:
+                        await maybe_await(options.first.click(timeout=3000))
+                        logger.debug("[Workday] Edu: School selected first option")
+                    except Exception:
+                        pass
+                # Dismiss dropdown
+                try:
+                    await maybe_await(keyboard.press("Escape"))
+                    await asyncio.sleep(0.3)
+                    mouse = getattr(page, "mouse", None)
+                    if mouse:
+                        await maybe_await(mouse.click(10, 10))
+                        await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+            # If no listbox appeared, plain fill was enough — done.
+        except Exception as exc:
+            logger.debug("[Workday] Edu: School failed: %s", exc)
+
     async def _fill_field_of_study_picker(
         self, page: Any, section: Any, search_term: str,
     ) -> bool:

@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -119,13 +120,32 @@ async def human_pause(prompt: str) -> str:
     """
     Pause for human input without blocking the event loop.
     Intended for local/headful "human-in-loop" runs.
-    """
-    try:
-        import asyncio
 
-        return str(await asyncio.to_thread(input, prompt))
-    except Exception:
-        return ""
+    When stdin is a TTY, blocks on ``input()``.  Otherwise falls back to a
+    file-based signal: polls for ``/tmp/openclaw_continue`` and proceeds
+    once it appears (then deletes it).  This lets IDE-launched runs pause
+    for manual auth steps.
+    """
+    import asyncio
+
+    if sys.stdin.isatty():
+        try:
+            return str(await asyncio.to_thread(input, prompt))
+        except Exception:
+            return ""
+
+    signal_path = Path("/tmp/openclaw_continue")
+    signal_path.unlink(missing_ok=True)
+    print(
+        f"\n[WAITING] {prompt}\n"
+        f"  Browser is open — complete the manual step, then run:\n"
+        f"    touch /tmp/openclaw_continue\n",
+        file=sys.stderr,
+    )
+    while not signal_path.exists():
+        await asyncio.sleep(1)
+    signal_path.unlink(missing_ok=True)
+    return ""
 
 
 async def smart_goto(

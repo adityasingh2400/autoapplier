@@ -37,6 +37,12 @@ from openclaw.harvest import (
     write_harvest_report,
 )
 
+from openclaw.scoring import (
+    JobLedger,
+    JobScorer,
+    scrape_job_descriptions_batch,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +264,7 @@ async def run_single_application(
             allow_captcha_auto_solve=allow_captcha_auto_solve,
         )
         # In interactive human-in-loop runs, do not kill the session while waiting for manual auth/2FA/email steps.
-        if human_in_loop and sys.stdin.isatty():
+        if human_in_loop:
             result = await handler.apply(session.page, context)
         else:
             result = await asyncio.wait_for(handler.apply(session.page, context), timeout=timeout_sec)
@@ -588,6 +594,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If a tailored resume PDF can be generated, upload it instead of memory/resume.pdf.",
     )
+    # --- Job Scoring CLI flags ---
+    parser.add_argument(
+        "--score-jobs",
+        action="store_true",
+        help="Score and rank new jobs from source. Scrapes JDs and uses LLM to score fit.",
+    )
+    parser.add_argument(
+        "--list-scored-jobs",
+        action="store_true",
+        help="List previously scored jobs from the ledger, sorted by score.",
+    )
+    parser.add_argument(
+        "--apply-top-scored",
+        action="store_true",
+        help="Apply to top-scored unapplied jobs from the ledger.",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=None,
+        help="Minimum score threshold for --list-scored-jobs or --apply-top-scored.",
+    )
+    parser.add_argument(
+        "--ledger-stats",
+        action="store_true",
+        help="Print job ledger statistics and exit.",
+    )
+    parser.add_argument(
+        "--score-unscored",
+        action="store_true",
+        help="Score all jobs already in the ledger that haven't been scored yet.",
+    )
     return parser
 
 
@@ -600,6 +638,19 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--upload-tailored-resume requires --quality.")
     if args.upload_tailored_resume and not args.tailor_resume:
         parser.error("--upload-tailored-resume requires --tailor-resume.")
+    
+    # Scoring mode validations
+    if args.ledger_stats:
+        return  # No other args needed
+    if args.list_scored_jobs:
+        return  # No other args needed
+    if getattr(args, 'score_unscored', False):
+        return  # No other args needed
+    if args.score_jobs and not args.source:
+        parser.error("--score-jobs requires --source simplify")
+    if args.apply_top_scored and not args.source:
+        parser.error("--apply-top-scored requires --source simplify")
+    
     if args.source:
         if args.job_url:
             parser.error("Do not pass a positional job_url when --source is used.")
@@ -944,13 +995,425 @@ async def run_direct_mode(args: argparse.Namespace, memory_root: Path) -> dict[s
     )
 
 
+# =============================================================================
+# Job Scoring Mode Functions
+# =============================================================================
+
+
+async def run_score_jobs(args: argparse.Namespace, memory_root: Path) -> dict[str, Any]:
+    """
+    Score new jobs from Simplify source:
+    1. Fetch jobs from source
+    2. Filter to only new jobs (not in ledger)
+    3. Scrape job descriptions in parallel
+    4. Score each job using LLM
+    5. Save to ledger and return ranked results
+    """
+    ledger = JobLedger()
+    
+    # Fetch jobs from source
+    try:
+        max_age = args.max_age_hours if args.max_age_hours else 72.0
+        roles = fetch_simplify_roles(
+            category=args.category,
+            company_keyword=args.company_keyword,
+            role_keyword=args.role_keyword,
+            max_age_hours=max_age,
+            limit=None,  # Get all, we'll filter by ledger
+            include_unknown_ats=not args.exclude_unknown_ats,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"Failed to fetch Simplify source: {exc}",
+            "timestamp": utc_now_iso(),
+        }
+
+    # Filter to new jobs only
+    all_urls = [r.apply_url for r in roles]
+    new_urls = set(ledger.get_new_jobs(all_urls))
+    new_roles = [r for r in roles if r.apply_url in new_urls]
+
+    if not new_roles:
+        stats = ledger.stats()
+        return {
+            "status": "no_new_jobs",
+            "message": "No new jobs found since last run",
+            "total_fetched": len(roles),
+            "ledger_stats": stats,
+            "timestamp": utc_now_iso(),
+        }
+
+    # Limit to max_jobs for this run
+    if args.max_jobs and len(new_roles) > args.max_jobs:
+        new_roles = new_roles[:args.max_jobs]
+
+    logger.info("Found %d new jobs to score (out of %d total)", len(new_roles), len(roles))
+
+    # Add new jobs to ledger first
+    for role in new_roles:
+        ledger.add_job(
+            url=role.apply_url,
+            company=role.company,
+            role=role.role,
+            location=role.location,
+            category=role.category,
+            age_hours=role.age_hours,
+        )
+    ledger.save()
+
+    # Scrape job descriptions in parallel
+    urls_to_scrape = [r.apply_url for r in new_roles]
+    logger.info("Scraping %d job descriptions...", len(urls_to_scrape))
+    jd_map = await scrape_job_descriptions_batch(urls_to_scrape, concurrency=5)
+
+    # Update ledger with JDs
+    for url, jd in jd_map.items():
+        if jd:
+            ledger.update_jd(url, jd)
+    ledger.save()
+
+    # Load profile for scoring
+    profile = load_user_profile(memory_root)
+    scorer = JobScorer()
+
+    # Score each job
+    scored_results: list[dict[str, Any]] = []
+    for role in new_roles:
+        jd = jd_map.get(role.apply_url, "")
+        entry = ledger.get(role.apply_url)
+        
+        scored = scorer.score_job(
+            company=role.company,
+            role=role.role,
+            location=role.location,
+            job_description=jd,
+            profile_summary=profile.summary,
+            resume_text=profile.resume_text,
+            age_hours=role.age_hours,
+        )
+        scored.url = role.apply_url
+
+        # Update ledger with score
+        ledger.update_score(
+            role.apply_url,
+            score=scored.score,
+            breakdown=scored.breakdown,
+            reasoning=scored.reasoning,
+            recommendation=scored.recommendation,
+        )
+
+        scored_results.append({
+            "company": role.company,
+            "role": role.role,
+            "location": role.location,
+            "url": role.apply_url,
+            "age": role.age,
+            "score": scored.score,
+            "breakdown": scored.breakdown,
+            "reasoning": scored.reasoning,
+            "recommendation": scored.recommendation,
+            "jd_length": len(jd),
+        })
+
+        logger.info(
+            "Scored: %.0f %s - %s @ %s",
+            scored.score,
+            scored.recommendation,
+            role.role[:40],
+            role.company[:25],
+        )
+
+    ledger.save()
+
+    # Sort by score descending
+    scored_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # Summary stats
+    high_priority = sum(1 for r in scored_results if r.get("recommendation") == "high_priority")
+    medium = sum(1 for r in scored_results if r.get("recommendation") == "medium")
+    low = sum(1 for r in scored_results if r.get("recommendation") == "low")
+    skip = sum(1 for r in scored_results if r.get("recommendation") == "skip")
+
+    return {
+        "status": "scoring_complete",
+        "new_jobs_scored": len(scored_results),
+        "total_in_source": len(roles),
+        "summary": {
+            "high_priority": high_priority,
+            "medium": medium,
+            "low": low,
+            "skip": skip,
+        },
+        "jobs": scored_results,
+        "ledger_stats": ledger.stats(),
+        "timestamp": utc_now_iso(),
+    }
+
+
+async def run_list_scored_jobs(args: argparse.Namespace) -> dict[str, Any]:
+    """List scored jobs from the ledger."""
+    ledger = JobLedger()
+    
+    jobs = ledger.get_scored_jobs(
+        min_score=args.min_score,
+        unapplied_only=False,
+    )
+    
+    # Sort by score descending
+    jobs.sort(key=lambda j: j.score or 0, reverse=True)
+
+    results = []
+    for job in jobs:
+        results.append({
+            "company": job.company,
+            "role": job.role,
+            "location": job.location,
+            "url": job.url,
+            "score": job.score,
+            "recommendation": job.recommendation,
+            "reasoning": job.score_reasoning[:200] if job.score_reasoning else "",
+            "applied": job.applied,
+            "applied_at": job.applied_at,
+            "first_seen": job.first_seen,
+        })
+
+    return {
+        "status": "scored_jobs",
+        "count": len(results),
+        "min_score_filter": args.min_score,
+        "jobs": results,
+        "ledger_stats": ledger.stats(),
+        "timestamp": utc_now_iso(),
+    }
+
+
+async def run_apply_top_scored(args: argparse.Namespace, memory_root: Path) -> dict[str, Any]:
+    """Apply to top-scored unapplied jobs."""
+    ledger = JobLedger()
+    
+    min_score = args.min_score if args.min_score is not None else 70.0
+    top_jobs = ledger.get_top_jobs(
+        limit=args.max_jobs,
+        min_score=min_score,
+        unapplied_only=True,
+    )
+
+    if not top_jobs:
+        return {
+            "status": "no_jobs_to_apply",
+            "message": f"No unapplied jobs with score >= {min_score}",
+            "ledger_stats": ledger.stats(),
+            "timestamp": utc_now_iso(),
+        }
+
+    logger.info("Applying to %d top-scored jobs (min_score=%.0f)", len(top_jobs), min_score)
+
+    profile = load_user_profile(memory_root)
+    question_answerer = QuestionAnswerer()
+
+    headless = True
+    if args.headful or args.keep_open or (args.human_in_loop and not args.headless):
+        headless = False
+
+    session: BrowserSession | None = None
+    if args.reuse_session:
+        session = await launch_browser_session_with_engine(headless=headless)
+
+    results: list[dict[str, Any]] = []
+    try:
+        for job in top_jobs:
+            logger.info(
+                "Applying: %.0f %s - %s @ %s",
+                job.score or 0,
+                job.recommendation,
+                job.role[:40],
+                job.company[:25],
+            )
+
+            result = await run_single_application(
+                job_url=job.url,
+                company=job.company,
+                role=job.role,
+                memory_root=memory_root,
+                profile=profile,
+                question_answerer=question_answerer,
+                dry_run=args.dry_run,
+                force_submit=args.force,
+                timeout_sec=args.timeout_sec,
+                human_in_loop=args.human_in_loop,
+                max_form_pages=args.max_form_pages,
+                max_custom_questions=args.max_custom_questions,
+                pause_on_captcha=not args.no_pause_on_captcha,
+                pause_on_auth=not args.no_pause_on_auth,
+                pause_on_missing_fields=not args.no_pause_on_missing_fields,
+                allow_captcha_auto_solve=not args.no_captcha_auto_solve,
+                source="simplify",
+                quality=args.quality,
+                tailor_resume=args.tailor_resume,
+                upload_tailored_resume=args.upload_tailored_resume,
+                keep_open=args.keep_open,
+                session=session,
+                headless=headless,
+            )
+
+            # Update ledger with apply status
+            status = str(result.get("status", "unknown"))
+            ledger.mark_applied(job.url, status)
+            ledger.save()
+
+            result["job_score"] = job.score
+            result["job_recommendation"] = job.recommendation
+            results.append(result)
+
+    finally:
+        if session is not None:
+            await session.close()
+
+    status_counts: dict[str, int] = {}
+    for item in results:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    return {
+        "status": "apply_batch_complete",
+        "applied_count": len(results),
+        "min_score": min_score,
+        "results": results,
+        "status_counts": status_counts,
+        "ledger_stats": ledger.stats(),
+        "timestamp": utc_now_iso(),
+    }
+
+
+async def run_score_unscored(args: argparse.Namespace, memory_root: Path) -> dict[str, Any]:
+    """Score all jobs in the ledger that haven't been scored yet."""
+    ledger = JobLedger()
+    unscored = ledger.get_unscored_jobs()
+
+    if not unscored:
+        return {
+            "status": "no_new_jobs",
+            "message": "No unscored jobs in ledger — everything has already been scored.",
+            "ledger_stats": ledger.stats(),
+            "timestamp": utc_now_iso(),
+        }
+
+    logger.info("Scoring %d unscored jobs from ledger", len(unscored))
+    profile = load_user_profile(memory_root)
+    scorer = JobScorer()
+
+    scored_results: list[dict[str, Any]] = []
+    for entry in unscored:
+        scored = scorer.score_job(
+            company=entry.company,
+            role=entry.role,
+            location=entry.location,
+            job_description=entry.job_description,
+            profile_summary=profile.summary,
+            resume_text=profile.resume_text,
+            age_hours=entry.age_hours_at_discovery,
+        )
+        scored.url = entry.url
+
+        ledger.update_score(
+            entry.url,
+            score=scored.score,
+            breakdown=scored.breakdown,
+            reasoning=scored.reasoning,
+            recommendation=scored.recommendation,
+        )
+
+        scored_results.append({
+            "company": entry.company,
+            "role": entry.role,
+            "location": entry.location,
+            "url": entry.url,
+            "score": scored.score,
+            "breakdown": scored.breakdown,
+            "reasoning": scored.reasoning,
+            "recommendation": scored.recommendation,
+        })
+
+        logger.info(
+            "Scored: %.0f %s - %s @ %s",
+            scored.score,
+            scored.recommendation,
+            entry.role[:40],
+            entry.company[:25],
+        )
+
+    ledger.save()
+
+    scored_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    high_priority = sum(1 for r in scored_results if r.get("recommendation") == "high_priority")
+    medium = sum(1 for r in scored_results if r.get("recommendation") == "medium")
+    low = sum(1 for r in scored_results if r.get("recommendation") == "low")
+    skip = sum(1 for r in scored_results if r.get("recommendation") == "skip")
+
+    return {
+        "status": "scoring_complete",
+        "new_jobs_scored": len(scored_results),
+        "total_in_source": len(unscored),
+        "summary": {
+            "high_priority": high_priority,
+            "medium": medium,
+            "low": low,
+            "skip": skip,
+        },
+        "jobs": scored_results,
+        "ledger_stats": ledger.stats(),
+        "timestamp": utc_now_iso(),
+    }
+
+
+def run_ledger_stats() -> dict[str, Any]:
+    """Print ledger statistics."""
+    ledger = JobLedger()
+    stats = ledger.stats()
+    
+    # Get top 5 jobs for quick view
+    top_jobs = ledger.get_top_jobs(limit=5, unapplied_only=True)
+    top_preview = [
+        {
+            "company": j.company,
+            "role": j.role,
+            "score": j.score,
+            "recommendation": j.recommendation,
+        }
+        for j in top_jobs
+    ]
+
+    return {
+        "status": "ledger_stats",
+        "stats": stats,
+        "top_unapplied_jobs": top_preview,
+        "ledger_path": str(ledger.ledger_path),
+        "timestamp": utc_now_iso(),
+    }
+
+
 async def async_main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     validate_args(parser, args)
     setup_logging(verbose=args.verbose)
 
+    # Handle ledger stats (no memory root needed)
+    if args.ledger_stats:
+        result = run_ledger_stats()
+        print(json.dumps(result, indent=2), flush=True)
+        return 0
+
+    # Handle list scored jobs (no memory root needed)
+    if args.list_scored_jobs:
+        result = await run_list_scored_jobs(args)
+        print(json.dumps(result, indent=2), flush=True)
+        return 0
+
+    # Handle score-unscored (needs memory root for profile)
     should_persist = not (args.source == "simplify" and args.list_source_jobs)
+
     if should_persist:
         memory_root = _resolve_memory_root(args.memory_root)
     else:
@@ -974,8 +1437,17 @@ async def async_main() -> int:
             print(json.dumps(payload, indent=2), flush=True)
             return 0
 
+    if getattr(args, 'score_unscored', False):
+        result = await run_score_unscored(args, memory_root)
+        print(json.dumps(result, indent=2), flush=True)
+        return 0
+
     if args.source == "simplify":
-        if args.harvest_answer_bank:
+        if args.score_jobs:
+            result = await run_score_jobs(args, memory_root)
+        elif args.apply_top_scored:
+            result = await run_apply_top_scored(args, memory_root)
+        elif args.harvest_answer_bank:
             result = await run_source_harvest(args, memory_root)
         else:
             result = await run_source_mode(args, memory_root)

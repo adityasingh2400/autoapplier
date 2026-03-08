@@ -39,7 +39,7 @@ class QuestionAnswerer:
     # Override by passing `QuestionAnswerer(model_id=...)` if needed.
     # Use `global.` prefix for cross-Region inference profile (required for on-demand).
     model_id: str = os.getenv(
-        "OPENCLAW_BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        "OPENCLAW_BEDROCK_MODEL_ID", "arn:aws:bedrock:us-east-1:128009599260:inference-profile/us.anthropic.claude-sonnet-4-6"
     )
     max_tokens: int = 260
     temperature: float = 0.2

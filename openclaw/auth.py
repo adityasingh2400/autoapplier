@@ -797,7 +797,7 @@ async def _attempt_login(page: Any, *, email: str, password: str) -> bool:
             sign_in_link = page.locator('[data-automation-id="signInLink"]')
             if await sign_in_link.count() > 0:
                 await sign_in_link.first.click(force=True, timeout=3000)
-                await _wait_brief(page, 1000)
+                await _wait_brief(page, 1500)
             else:
                 return False
 
@@ -811,12 +811,19 @@ async def _attempt_login(page: Any, *, email: str, password: str) -> bool:
         await pw_field.fill("", timeout=1000)
         await pw_field.type(password, delay=30, timeout=10000)
 
-        # Workday login submit — try signInSubmitButton first, fall back to generic
-        for aid in ["signInSubmitButton", "signInLink"]:
-            btn = page.locator(f'[data-automation-id="{aid}"]')
-            if await btn.count() > 0:
-                await btn.first.click(force=True, timeout=3000)
-                break
+        # Workday login submit — signInSubmitButton is the actual submit button.
+        # Do NOT use signInLink here: that's the tab to switch views, not the submit button.
+        submit_btn = page.locator('[data-automation-id="signInSubmitButton"]')
+        if await submit_btn.count() > 0:
+            await submit_btn.first.click(force=True, timeout=3000)
+        else:
+            await smart_click(
+                page,
+                prompt=None,
+                selectors=["button:has-text('Sign in')", "button:has-text('Log in')", "button:has-text('Login')"],
+                text_candidates=["Sign in", "Log in", "Login"],
+                prefer_prompt=False,
+            )
     else:
         # ---- Generic path ----
         await _fill_all_matching(
@@ -864,7 +871,8 @@ async def _attempt_login(page: Any, *, email: str, password: str) -> bool:
             prefer_prompt=False,
         )
 
-    await _wait_brief(page, 1100)
+    # Wait for redirect/processing — Workday can take 2+ seconds
+    await _wait_brief(page, 2500 if workday else 1100)
     state = await detect_auth_wall(page)
     return not state.detected
 
@@ -1079,7 +1087,7 @@ async def maybe_auto_authenticate(
                 detection = now
 
         shot = await capture_step(page, output_dir, f"{stage}-{detection.kind}", screenshots)
-        if human_in_loop and pause_on_auth and sys.stdin.isatty():
+        if human_in_loop and pause_on_auth:
             msg = {
                 "two_factor": "2FA required. Complete it manually (SMS/authenticator), then press Enter.",
                 "email_verification": "Email verification required. If auto-verification didn't work, complete it (check email / enter code), then press Enter.",
@@ -1136,14 +1144,17 @@ async def maybe_auto_authenticate(
                 sign_in_link = page.locator('[data-automation-id="signInLink"]')
                 if await sign_in_link.count() > 0:
                     await sign_in_link.first.click(force=True, timeout=3000)
-                    await _wait_brief(page, 1000)
+                    await _wait_brief(page, 1500)
                     switched = True
             if not switched:
                 switched = await _switch_to_login_if_possible(page)
                 if switched:
-                    await _wait_brief(page, 650)
+                    await _wait_brief(page, 1000)
             if not switched:
                 logger.warning("Could not switch to login view; will try login on current page")
+            else:
+                # Wait for sign-in form to be ready (verifyPassword gone on Workday)
+                await _wait_brief(page, 800)
 
         ok = await _attempt_login(page, email=creds.get("email") or email, password=creds["password"])
         if ok:
@@ -1280,7 +1291,7 @@ async def maybe_auto_authenticate(
                         return {"ok": True, "performed": True, "kind": "", "host": host}
 
             # If nothing worked automatically, pause for human.
-            if human_in_loop and pause_on_auth and sys.stdin.isatty():
+            if human_in_loop and pause_on_auth:
                 shot = await capture_step(page, output_dir, f"{stage}-verify-email", screenshots)
                 print(
                     f"\nWorkday account created. If email verification is needed,\n"
