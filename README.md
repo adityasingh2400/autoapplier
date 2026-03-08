@@ -1,38 +1,38 @@
-# OpenClaw
+# Autoapplier
 
-Two tools in one repo: a **Job Match Ranker** (web dashboard) and an **Auto-Applier** (CLI bot that fills and submits job applications).
+Two tools in one repo:
+
+1. **Job Match Ranker** -- a web dashboard that scores and ranks job postings against your resume
+2. **Auto-Applier** -- a CLI bot that fills out and submits job applications automatically
 
 ---
 
-## 1. Job Match Ranker (Web Dashboard)
+## Job Match Ranker
 
-A local web UI that scores and ranks job postings against your resume using an LLM. Runs at **http://localhost:5050**.
+A local web dashboard at **http://localhost:5050** that helps you figure out which jobs are worth applying to.
 
-**What it does:**
-- Pulls fresh internship/job postings from SimplifyJobs
+- Pulls fresh postings from SimplifyJobs
 - Scrapes each job description
-- Uses AWS Bedrock Claude to score fit (0-100) based on experience match, recency, and location
-- Displays a ranked dashboard: filter by score, age, category, and applied status
-- One-click "Mark Applied" to track what you've already submitted
-
-**Run it:**
+- Scores fit (0-100) using AWS Bedrock Claude based on experience match, recency, and location
+- Ranked table you can filter by score, age, category, and applied status
+- Track what you've applied to with one-click "Mark Applied"
 
 ```bash
 python -m openclaw.web_ui
 # Open http://localhost:5050
 ```
 
-From the dashboard you can click "Score New Jobs" to fetch and rank the latest postings, or "Score Unscored" to process jobs already in the ledger that haven't been scored yet.
+Click **Score New Jobs** to fetch and rank the latest postings. Click **Score Unscored** to process any jobs already in the ledger that haven't been scored yet.
 
 ---
 
-## 2. Auto-Applier (CLI)
+## Auto-Applier
 
-A headless browser bot that navigates to a job posting, fills out the entire application form, uploads your resume, answers custom questions via LLM, and optionally submits.
+A headless browser bot that opens a job posting, fills every field, uploads your resume, answers custom questions with an LLM, and optionally submits.
 
-**Supported ATS platforms:** Lever, Greenhouse, Ashby, Workday, plus a generic fallback.
+Supports **Lever, Greenhouse, Ashby, Workday**, and a generic fallback for other sites.
 
-**Single application:**
+**Apply to a single job:**
 
 ```bash
 python -m openclaw.applier "https://jobs.lever.co/company/job-id" \
@@ -41,7 +41,7 @@ python -m openclaw.applier "https://jobs.lever.co/company/job-id" \
   --dry-run
 ```
 
-**Batch apply from SimplifyJobs source:**
+**Batch apply from SimplifyJobs:**
 
 ```bash
 python -m openclaw.applier --source simplify \
@@ -50,14 +50,14 @@ python -m openclaw.applier --source simplify \
   --dry-run
 ```
 
-**Apply to your top-ranked jobs (from the scorer):**
+**Apply to your top-ranked jobs from the scorer:**
 
 ```bash
 python -m openclaw.applier --source simplify --apply-top-scored \
   --min-score 75 --max-jobs 5 --dry-run
 ```
 
-Remove `--dry-run` to actually submit.
+Drop `--dry-run` to actually submit.
 
 ---
 
@@ -68,38 +68,38 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-**Memory folder:** Create a local `real_memory/` directory (gitignored) with your personal data:
+Create a `real_memory/` folder (gitignored) with your personal data:
 
 ```
 real_memory/
-├── profile.json   # Your details + answer bank (copy from profile.example.json)
+├── profile.json   # Your info + answer bank (copy from profile.example.json)
 ├── resume.json    # Structured resume data
-└── resume.pdf     # Your resume file
+└── resume.pdf     # Your actual resume
 ```
 
-**AWS credentials:** The scorer and question answerer use AWS Bedrock Claude. Configure `~/.aws/credentials` or set the usual `AWS_*` env vars.
+The scorer and question answerer call AWS Bedrock Claude. Set up `~/.aws/credentials` or the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars.
 
 ---
 
-## Key CLI Flags
+## CLI Flags
 
 | Flag | What it does |
 |------|-------------|
 | `--dry-run` | Fill forms but don't submit |
-| `--force` | Allow auto-submit for top-tier companies |
-| `--human-in-loop` | Pause for CAPTCHAs, auth, or missing fields |
+| `--force` | Auto-submit even for top-tier companies |
+| `--human-in-loop` | Pause for CAPTCHAs, auth walls, or missing fields |
 | `--headful` | Show the browser window |
-| `--keep-open` | Leave browser open after run for manual review |
-| `--quality` | Generate cover letter text, richer answers (slower) |
-| `--score-jobs` | Score new jobs from source (requires `--source simplify`) |
+| `--keep-open` | Leave browser open after the run for manual review |
+| `--quality` | Generate cover letters, richer answers (slower) |
+| `--score-jobs` | Score new jobs from source (`--source simplify` required) |
 | `--list-scored-jobs` | Print scored jobs from the ledger |
-| `--ledger-stats` | Print ledger statistics |
+| `--ledger-stats` | Print ledger stats |
 | `-v` | Verbose logging |
 
 ## Answer Bank
 
-Add a `questionBank` array to `profile.json` to pre-fill common form fields consistently. Patterns are matched best-match-wins against form labels. Use `__HUMAN__` to force manual input for sensitive questions. See `profile.example.json` for the full template.
+Add a `questionBank` array to `profile.json` to give consistent answers to common form fields (LinkedIn URL, "how did you hear about us", etc.). Matching is best-match-wins against form labels. Use `__HUMAN__` for questions you want to answer yourself. See `profile.example.json` for the full template.
 
 ## Privacy
 
-`real_memory/`, `test_memory/`, `.env`, and credentials are all gitignored. Only source code, config templates, and this README are committed. Never commit your personal `profile.json` or resume.
+`real_memory/`, `test_memory/`, `.env`, and all credential files are gitignored. Only source code, config templates, and this README get committed.
