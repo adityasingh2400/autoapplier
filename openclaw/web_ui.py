@@ -4,16 +4,44 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import re
 import subprocess
 import sys
 import threading
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openclaw.scoring import JobLedger
 
 PORT = 5050
+
+
+def _infer_memory_root() -> str:
+    env_value = os.getenv("OPENCLAW_MEMORY_ROOT")
+    if env_value:
+        return env_value
+
+    repo_root = Path(__file__).resolve().parents[1]
+    for candidate in (repo_root / "real_memory", repo_root / "memory", repo_root / "test_memory"):
+        if (candidate / "profile.json").exists() and (candidate / "resume.json").exists():
+            return str(candidate)
+    return str(repo_root / "real_memory")
+
+
+def _job_within_age_limit(posted_at: str | None, first_seen: str | None, max_age_hours: float | None) -> bool:
+    if max_age_hours is None or max_age_hours <= 0:
+        return True
+    ref = posted_at or first_seen
+    if not ref:
+        return False
+    try:
+        timestamp = datetime.fromisoformat(ref.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    age_hours = (datetime.now(timezone.utc) - timestamp).total_seconds() / 3600.0
+    return age_hours <= max_age_hours
 
 # Translates raw log lines from the scoring process into human-friendly messages
 def _friendly_log(line: str) -> str | None:
@@ -70,7 +98,7 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>OpenClaw Job Scorer</title>
+    <title>Autoapplier Job Ranker</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -187,7 +215,18 @@ HTML_TEMPLATE = """
         .age-badge.recent { background: #2d2000; color: #d29922; border: 1px solid #9e6a03; }
         .age-badge.old    { background: #1c1c1c; color: #6e7681; border: 1px solid #30363d; }
         .age-note { font-size: 10px; color: #484f58; margin-top: 3px; }
-        .reasoning { font-size: 12px; color: #8b949e; max-width: 420px; line-height: 1.4; }
+        .reasoning { font-size: 12px; color: #8b949e; max-width: 460px; line-height: 1.45; }
+        .breakdown { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+        .mini-badge {
+            display: inline-block;
+            border: 1px solid #30363d;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 11px;
+            color: #c9d1d9;
+            background: #0d1117;
+        }
+        .status-note { margin-top: 6px; font-size: 11px; color: #8b949e; }
         a { color: #58a6ff; text-decoration: none; }
         a:hover { text-decoration: underline; }
         .applied-badge { color: #3fb950; font-size: 12px; font-weight: 600; }
@@ -201,7 +240,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>OpenClaw Job Scorer</h1>
+    <h1>Autoapplier Job Ranker</h1>
 
     <div class="stats">
         <div class="stat-box">
@@ -224,11 +263,15 @@ HTML_TEMPLATE = """
             <div class="number" id="applied">-</div>
             <div class="label">Applied</div>
         </div>
+        <div class="stat-box">
+            <div class="number" id="unscored">-</div>
+            <div class="label">Needs Scoring</div>
+        </div>
     </div>
 
     <div class="controls">
         <button onclick="scoreNewJobs()" id="score-btn">Score New Jobs</button>
-        <button onclick="scoreUnscored()" id="score-unscored-btn" class="secondary">Score Unscored (212)</button>
+        <button onclick="scoreUnscored()" id="score-unscored-btn" class="secondary">Score Unscored</button>
         <button onclick="refreshJobs()" class="secondary">Refresh List</button>
         <select id="max-jobs">
             <option value="20">20 jobs</option>
@@ -278,7 +321,7 @@ HTML_TEMPLATE = """
                 <th>Posted</th>
                 <th>Company / Role</th>
                 <th>Location</th>
-                <th>Reasoning</th>
+                <th>Why It Matters</th>
                 <th>Status</th>
             </tr>
         </thead>
@@ -313,10 +356,47 @@ HTML_TEMPLATE = """
             el.className = 'final-status show ' + type;
         }
 
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
+        function safeUrl(value) {
+            try {
+                const parsed = new URL(String(value || ''));
+                return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : '#';
+            } catch {
+                return '#';
+            }
+        }
+
+        function updateUnscoredButton(count) {
+            const btn = document.getElementById('score-unscored-btn');
+            btn.textContent = count > 0 ? `Score Unscored (${count})` : 'Score Unscored';
+            btn.disabled = false;
+        }
+
+        function formatBreakdown(breakdown) {
+            if (!breakdown || typeof breakdown !== 'object') return '';
+            const labels = [
+                ['experience_match', 'exp'],
+                ['role_alignment', 'role'],
+                ['recency', 'age'],
+                ['location', 'loc'],
+                ['application_friction', 'friction'],
+                ['confidence', 'conf'],
+            ];
+            const items = labels
+                .filter(([key]) => typeof breakdown[key] === 'number')
+                .map(([key, label]) => `<span class="mini-badge">${label} ${Math.round(breakdown[key])}</span>`);
+            return items.length ? `<div class="breakdown">${items.join('')}</div>` : '';
+        }
+
         function renderAge(postedAt, firstSeen) {
-            // Dynamically compute how long ago the job was posted.
-            // postedAt = estimated actual posting date (first_seen - age_hours_at_discovery)
-            // firstSeen = when we first scraped it (fallback)
             const ref = postedAt || firstSeen;
             if (!ref) {
                 return '<td class="age-cell"><span class="age-badge old">unknown</span></td>';
@@ -345,7 +425,7 @@ HTML_TEMPLATE = """
             btn.disabled = true;
             btn.textContent = 'Saving...';
             try {
-                const resp = await fetch(`/api/mark-applied?hash=${urlHash}`, { method: 'POST' });
+                const resp = await fetch(`/api/mark-applied?hash=${encodeURIComponent(urlHash)}`, { method: 'POST' });
                 const data = await resp.json();
                 if (data.ok) {
                     const row = btn.closest('tr');
@@ -354,7 +434,8 @@ HTML_TEMPLATE = """
                         className: 'applied-badge', textContent: '✓ Applied'
                     }));
                     document.getElementById('applied').textContent =
-                        parseInt(document.getElementById('applied').textContent || '0') + 1;
+                        parseInt(document.getElementById('applied').textContent || '0', 10) + 1;
+                    document.getElementById('unapplied-only').checked && refreshJobs();
                 }
             } catch (e) {
                 btn.disabled = false;
@@ -365,54 +446,59 @@ HTML_TEMPLATE = """
         async function refreshJobs() {
             const minScore = document.getElementById('min-score').value || 0;
             const unappliedOnly = document.getElementById('unapplied-only').checked;
+            const maxPostAge = parseInt(document.getElementById('max-post-age').value, 10) || 0;
             try {
-                const resp = await fetch(`/api/jobs?min_score=${minScore}&unapplied_only=${unappliedOnly}`);
+                const resp = await fetch(
+                    `/api/jobs?min_score=${encodeURIComponent(minScore)}&unapplied_only=${unappliedOnly}&max_post_age_hours=${maxPostAge}`
+                );
                 const data = await resp.json();
                 document.getElementById('total-jobs').textContent = data.stats.total_jobs;
                 document.getElementById('high-priority').textContent = data.stats.high_priority;
                 document.getElementById('medium').textContent = data.stats.medium;
-                document.getElementById('low-skip').textContent = data.stats.low + data.stats.skip;
+                document.getElementById('low-skip').textContent = (data.stats.low || 0) + (data.stats.skip || 0);
                 document.getElementById('applied').textContent = data.stats.applied;
+                document.getElementById('unscored').textContent = data.stats.unscored;
+                updateUnscoredButton(data.stats.unscored || 0);
 
                 const tbody = document.getElementById('jobs-table');
-
-                const maxPostAge = parseInt(document.getElementById('max-post-age').value);
-                const now = Date.now();
-                let filtered = data.jobs;
-                if (maxPostAge > 0) {
-                    const cutoffMs = maxPostAge * 3600000;
-                    filtered = filtered.filter(job => {
-                        const ref = job.posted_at || job.first_seen;
-                        if (!ref) return false;
-                        return (now - new Date(ref).getTime()) <= cutoffMs;
-                    });
-                }
-
-                if (filtered.length === 0) {
+                if (!data.jobs || data.jobs.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:#8b949e">No jobs match filters</td></tr>';
                     return;
                 }
-                tbody.innerHTML = filtered.map(job => {
-                    const scoreClass = job.score >= 80 ? 'high' : job.score >= 60 ? 'medium' : 'low';
-                    const recClass = job.recommendation.replace('_', '-');
+
+                tbody.innerHTML = data.jobs.map(job => {
+                    const scoreValue = Number(job.score || 0);
+                    const scoreClass = scoreValue >= 82 ? 'high' : scoreValue >= 68 ? 'medium' : 'low';
+                    const recClass = String(job.recommendation || 'low').replace('_', '-');
                     const ageCell = renderAge(job.posted_at, job.first_seen);
+                    const company = escapeHtml(job.company || 'Unknown');
+                    const role = escapeHtml(job.role || 'Unknown');
+                    const location = escapeHtml(job.location || '-');
+                    const reasoning = escapeHtml(job.reasoning || 'No reasoning available.');
+                    const applyStatus = job.apply_status ? `<div class="status-note">Last result: ${escapeHtml(job.apply_status)}</div>` : '';
+                    const breakdownHtml = formatBreakdown(job.score_breakdown || {});
+                    const applyHref = safeUrl(job.url);
+                    const applyLink = applyHref === '#'
+                        ? '<span class="status-note">No valid apply URL</span>'
+                        : `<a href="${applyHref}" target="_blank" rel="noopener noreferrer" style="font-size:11px">Apply →</a>`;
                     const appliedHtml = job.applied
                         ? '<span class="applied-badge">✓ Applied</span>'
-                        : `<button class="mark-applied-btn" onclick="markApplied('${job.url_hash}', this)">Mark Applied</button>`;
+                        : `<button class="mark-applied-btn" onclick="markApplied('${encodeURIComponent(job.url_hash || '')}', this)">Mark Applied</button>`;
                     return `
                         <tr class="${job.applied ? 'is-applied' : ''}">
-                            <td><span class="score ${scoreClass}">${job.score}</span></td>
+                            <td><span class="score ${scoreClass}">${Math.round(scoreValue)}</span></td>
                             ${ageCell}
                             <td>
-                                <div class="company">${job.company}</div>
-                                <div class="role">${job.role}</div>
-                                <a href="${job.url}" target="_blank" style="font-size:11px">Apply →</a>
+                                <div class="company">${company}</div>
+                                <div class="role">${role}</div>
+                                ${applyLink}
                             </td>
-                            <td class="location">${job.location}</td>
-                            <td class="reasoning">${job.reasoning || '-'}</td>
+                            <td class="location">${location}</td>
+                            <td class="reasoning">${reasoning}${breakdownHtml}</td>
                             <td>
-                                <span class="recommendation ${recClass}">${job.recommendation}</span>
+                                <span class="recommendation ${recClass}">${escapeHtml(job.recommendation || 'unknown')}</span>
                                 <div style="margin-top:6px">${appliedHtml}</div>
+                                ${applyStatus}
                             </td>
                         </tr>
                     `;
@@ -450,37 +536,22 @@ HTML_TEMPLATE = """
                     if (data.status === 'no_new_jobs') {
                         showFinal('No new jobs found — all current Simplify jobs are already in the ledger.', 'info');
                     } else if (data.status === 'scoring_complete') {
-                        showFinal(`✅ Done! Scored ${data.new_jobs_scored} new jobs — ${data.summary.high_priority} high priority, ${data.summary.medium} medium.`, 'success');
-                        refreshJobs();
+                        showFinal(`Done. Scored ${data.new_jobs_scored} new jobs — ${data.summary.high_priority} high priority, ${data.summary.medium} medium.`, 'success');
                     } else {
                         showFinal('Error: ' + (data.error || JSON.stringify(data)), 'error');
                     }
                 } catch {
                     showFinal('Scoring finished.', 'success');
-                    refreshJobs();
                 }
+                refreshJobs();
             });
 
-            evtSource.addEventListener('error', e => {
+            evtSource.addEventListener('error', () => {
                 evtSource.close();
                 btn.disabled = false;
                 btn.textContent = 'Score New Jobs';
-                showFinal('❌ Connection error during scoring.', 'error');
+                showFinal('Connection error during scoring.', 'error');
             });
-        }
-
-        // Initial load
-        refreshJobs();
-
-        async function loadUnscoredCount() {
-            try {
-                const resp = await fetch('/api/jobs?min_score=0&unapplied_only=false');
-                const data = await resp.json();
-                const total = data.stats.total_jobs;
-                const scored = (data.stats.high_priority || 0) + (data.stats.medium || 0) + (data.stats.low || 0) + (data.stats.skip || 0);
-                // approximate: total_jobs includes unscored
-                // we expose this via stats
-            } catch(e) {}
         }
 
         function scoreUnscored() {
@@ -499,31 +570,29 @@ HTML_TEMPLATE = """
 
             evtSource.addEventListener('done', e => {
                 evtSource.close();
-                btn.disabled = false;
-                btn.textContent = 'Score Unscored';
                 try {
                     const data = JSON.parse(e.data);
                     if (data.status === 'no_new_jobs') {
-                        showFinal('✅ All jobs in the ledger are already scored!', 'info');
+                        showFinal('All jobs in the ledger are already scored.', 'info');
                     } else if (data.status === 'scoring_complete') {
-                        showFinal(`✅ Done! Scored ${data.new_jobs_scored} previously unscored jobs — ${data.summary.high_priority} high priority, ${data.summary.medium} medium.`, 'success');
-                        refreshJobs();
+                        showFinal(`Done. Scored ${data.new_jobs_scored} previously unscored jobs — ${data.summary.high_priority} high priority, ${data.summary.medium} medium.`, 'success');
                     } else {
                         showFinal('Error: ' + (data.error || JSON.stringify(data)), 'error');
                     }
                 } catch {
                     showFinal('Scoring finished.', 'success');
-                    refreshJobs();
                 }
+                refreshJobs();
             });
 
-            evtSource.addEventListener('error', e => {
+            evtSource.addEventListener('error', () => {
                 evtSource.close();
-                btn.disabled = false;
-                btn.textContent = 'Score Unscored';
-                showFinal('❌ Connection error during scoring.', 'error');
+                showFinal('Connection error during scoring.', 'error');
+                refreshJobs();
             });
         }
+
+        refreshJobs();
     </script>
 </body>
 </html>
@@ -583,7 +652,7 @@ class JobScorerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         ledger = JobLedger()
-        entry = ledger._jobs.get(url_hash)
+        entry = ledger.get_by_hash(url_hash)
         if entry is None:
             self.send_json({'ok': False, 'error': 'job not found'})
             return
@@ -595,22 +664,20 @@ class JobScorerHandler(http.server.BaseHTTPRequestHandler):
     def handle_get_jobs(self, query):
         min_score = float(query.get('min_score', ['0'])[0])
         unapplied_only = query.get('unapplied_only', ['true'])[0].lower() == 'true'
+        max_post_age_hours = float(query.get('max_post_age_hours', ['0'])[0] or 0)
 
         ledger = JobLedger()
         jobs = ledger.get_scored_jobs(
             min_score=min_score if min_score > 0 else None,
             unapplied_only=unapplied_only
         )
+        if max_post_age_hours > 0:
+            jobs = [
+                job for job in jobs
+                if _job_within_age_limit(job.posted_at, job.first_seen, max_post_age_hours)
+            ]
         jobs.sort(key=lambda j: j.score or 0, reverse=True)
-
-        stats = {
-            'total_jobs': len(ledger._jobs),
-            'high_priority': sum(1 for j in ledger._jobs.values() if j.recommendation == 'high_priority'),
-            'medium': sum(1 for j in ledger._jobs.values() if j.recommendation == 'medium'),
-            'low': sum(1 for j in ledger._jobs.values() if j.recommendation == 'low'),
-            'skip': sum(1 for j in ledger._jobs.values() if j.recommendation == 'skip'),
-            'applied': sum(1 for j in ledger._jobs.values() if j.applied),
-        }
+        stats = ledger.stats()
 
         self.send_json({
             'jobs': [
@@ -623,8 +690,10 @@ class JobScorerHandler(http.server.BaseHTTPRequestHandler):
                     'score': j.score,
                     'posted_at': j.posted_at,
                     'reasoning': j.score_reasoning[:300] if j.score_reasoning else '',
+                    'score_breakdown': j.score_breakdown,
                     'recommendation': j.recommendation,
                     'applied': j.applied,
+                    'apply_status': j.apply_status,
                     'first_seen': j.first_seen,
                 }
                 for j in jobs[:200]
@@ -653,6 +722,7 @@ class JobScorerHandler(http.server.BaseHTTPRequestHandler):
             [
                 sys.executable, '-m', 'openclaw.applier',
                 '--score-unscored',
+                '--memory-root', _infer_memory_root(),
                 '-v',
             ],
             stdout=subprocess.PIPE,
@@ -714,6 +784,7 @@ class JobScorerHandler(http.server.BaseHTTPRequestHandler):
                 '--category', category,
                 '--max-age-hours', max_age_hours,
                 '--max-jobs', max_jobs,
+                '--memory-root', _infer_memory_root(),
                 '-v',
             ],
             stdout=subprocess.PIPE,
@@ -751,7 +822,7 @@ class JobScorerHandler(http.server.BaseHTTPRequestHandler):
 
 def main():
     print("\n" + "=" * 50)
-    print("  OpenClaw Job Scorer UI")
+    print("  Autoapplier Job Ranker")
     print(f"  Open http://localhost:{PORT} in your browser")
     print("=" * 50 + "\n")
 

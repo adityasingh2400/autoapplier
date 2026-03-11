@@ -1000,6 +1000,59 @@ async def run_direct_mode(args: argparse.Namespace, memory_root: Path) -> dict[s
 # =============================================================================
 
 
+def _score_job_for_profile(
+    scorer: JobScorer,
+    profile: Any,
+    *,
+    url: str,
+    company: str,
+    role: str,
+    location: str,
+    job_description: str,
+    age_hours: float | None,
+):
+    scored = scorer.score_job(
+        company=company,
+        role=role,
+        location=location,
+        job_description=job_description,
+        profile_summary=profile.summary,
+        resume_text=profile.resume_text,
+        age_hours=age_hours,
+        candidate_name=str(profile.standard_fields.get("full_name") or ""),
+        job_preferences=getattr(profile, "job_preferences", {}) or {},
+        job_url=url,
+    )
+    scored.url = url
+    return scored
+
+
+async def _score_jobs_for_profile(
+    scorer: JobScorer,
+    profile: Any,
+    jobs: list[dict[str, Any]],
+    *,
+    concurrency: int = 4,
+) -> list[Any]:
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def score_one(job: dict[str, Any]):
+        async with semaphore:
+            return await asyncio.to_thread(
+                _score_job_for_profile,
+                scorer,
+                profile,
+                url=str(job.get("url") or ""),
+                company=str(job.get("company") or ""),
+                role=str(job.get("role") or ""),
+                location=str(job.get("location") or ""),
+                job_description=str(job.get("job_description") or ""),
+                age_hours=job.get("age_hours"),
+            )
+
+    return await asyncio.gather(*(score_one(job) for job in jobs))
+
+
 async def run_score_jobs(args: argparse.Namespace, memory_root: Path) -> dict[str, Any]:
     """
     Score new jobs from Simplify source:
@@ -1077,26 +1130,30 @@ async def run_score_jobs(args: argparse.Namespace, memory_root: Path) -> dict[st
     profile = load_user_profile(memory_root)
     scorer = JobScorer()
 
-    # Score each job
-    scored_results: list[dict[str, Any]] = []
+    jobs_to_score: list[dict[str, Any]] = []
     for role in new_roles:
-        jd = jd_map.get(role.apply_url, "")
         entry = ledger.get(role.apply_url)
-        
-        scored = scorer.score_job(
-            company=role.company,
-            role=role.role,
-            location=role.location,
-            job_description=jd,
-            profile_summary=profile.summary,
-            resume_text=profile.resume_text,
-            age_hours=role.age_hours,
+        jobs_to_score.append(
+            {
+                "company": role.company,
+                "role": role.role,
+                "location": role.location,
+                "url": role.apply_url,
+                "age": role.age,
+                "age_hours": role.age_hours,
+                "job_description": jd_map.get(role.apply_url, "") or (entry.job_description if entry else ""),
+            }
         )
-        scored.url = role.apply_url
+
+    scored_jobs = await _score_jobs_for_profile(scorer, profile, jobs_to_score, concurrency=4)
+
+    scored_results: list[dict[str, Any]] = []
+    for job, scored in zip(jobs_to_score, scored_jobs, strict=False):
+        jd = str(job.get("job_description") or "")
 
         # Update ledger with score
         ledger.update_score(
-            role.apply_url,
+            str(job.get("url") or ""),
             score=scored.score,
             breakdown=scored.breakdown,
             reasoning=scored.reasoning,
@@ -1104,11 +1161,11 @@ async def run_score_jobs(args: argparse.Namespace, memory_root: Path) -> dict[st
         )
 
         scored_results.append({
-            "company": role.company,
-            "role": role.role,
-            "location": role.location,
-            "url": role.apply_url,
-            "age": role.age,
+            "company": job.get("company"),
+            "role": job.get("role"),
+            "location": job.get("location"),
+            "url": job.get("url"),
+            "age": job.get("age"),
             "score": scored.score,
             "breakdown": scored.breakdown,
             "reasoning": scored.reasoning,
@@ -1120,8 +1177,8 @@ async def run_score_jobs(args: argparse.Namespace, memory_root: Path) -> dict[st
             "Scored: %.0f %s - %s @ %s",
             scored.score,
             scored.recommendation,
-            role.role[:40],
-            role.company[:25],
+            str(job.get("role") or "")[:40],
+            str(job.get("company") or "")[:25],
         )
 
     ledger.save()
@@ -1259,7 +1316,7 @@ async def run_apply_top_scored(args: argparse.Namespace, memory_root: Path) -> d
 
             # Update ledger with apply status
             status = str(result.get("status", "unknown"))
-            ledger.mark_applied(job.url, status)
+            ledger.record_apply_result(job.url, status)
             ledger.save()
 
             result["job_score"] = job.score
@@ -1303,21 +1360,37 @@ async def run_score_unscored(args: argparse.Namespace, memory_root: Path) -> dic
     profile = load_user_profile(memory_root)
     scorer = JobScorer()
 
-    scored_results: list[dict[str, Any]] = []
-    for entry in unscored:
-        scored = scorer.score_job(
-            company=entry.company,
-            role=entry.role,
-            location=entry.location,
-            job_description=entry.job_description,
-            profile_summary=profile.summary,
-            resume_text=profile.resume_text,
-            age_hours=entry.age_hours_at_discovery,
-        )
-        scored.url = entry.url
+    urls_missing_jd = [
+        entry.url
+        for entry in unscored
+        if not entry.jd_scraped or not (entry.job_description or "").strip()
+    ]
+    if urls_missing_jd:
+        logger.info("Scraping %d missing job descriptions before scoring unscored jobs", len(urls_missing_jd))
+        jd_map = await scrape_job_descriptions_batch(urls_missing_jd, concurrency=4)
+        for url, jd in jd_map.items():
+            if jd:
+                ledger.update_jd(url, jd)
+        ledger.save()
 
+    jobs_to_score = [
+        {
+            "company": entry.company,
+            "role": entry.role,
+            "location": entry.location,
+            "url": entry.url,
+            "age_hours": entry.age_hours_at_discovery,
+            "job_description": (ledger.get(entry.url).job_description if ledger.get(entry.url) else entry.job_description),
+        }
+        for entry in unscored
+    ]
+
+    scored_jobs = await _score_jobs_for_profile(scorer, profile, jobs_to_score, concurrency=4)
+
+    scored_results: list[dict[str, Any]] = []
+    for job, scored in zip(jobs_to_score, scored_jobs, strict=False):
         ledger.update_score(
-            entry.url,
+            str(job.get("url") or ""),
             score=scored.score,
             breakdown=scored.breakdown,
             reasoning=scored.reasoning,
@@ -1325,10 +1398,10 @@ async def run_score_unscored(args: argparse.Namespace, memory_root: Path) -> dic
         )
 
         scored_results.append({
-            "company": entry.company,
-            "role": entry.role,
-            "location": entry.location,
-            "url": entry.url,
+            "company": job.get("company"),
+            "role": job.get("role"),
+            "location": job.get("location"),
+            "url": job.get("url"),
             "score": scored.score,
             "breakdown": scored.breakdown,
             "reasoning": scored.reasoning,
@@ -1339,8 +1412,8 @@ async def run_score_unscored(args: argparse.Namespace, memory_root: Path) -> dic
             "Scored: %.0f %s - %s @ %s",
             scored.score,
             scored.recommendation,
-            entry.role[:40],
-            entry.company[:25],
+            str(job.get("role") or "")[:40],
+            str(job.get("company") or "")[:25],
         )
 
     ledger.save()

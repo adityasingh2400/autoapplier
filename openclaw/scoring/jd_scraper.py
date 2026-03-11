@@ -73,6 +73,7 @@ async def scrape_job_description(
     cache_dir: Path | None = None,
     timeout_ms: int = 15000,
     use_cache: bool = True,
+    cache_failures: bool = False,
 ) -> str:
     """
     Scrape the job description from a job posting URL.
@@ -97,8 +98,8 @@ async def scrape_job_description(
     # Scrape the page
     jd = await _scrape_page(url, timeout_ms=timeout_ms)
 
-    # Cache the result (even if empty, to avoid re-scraping failures)
-    if use_cache:
+    # Cache successful results. Failed/empty scrapes should be retried on future runs.
+    if use_cache and (jd or cache_failures):
         cache_dir.mkdir(parents=True, exist_ok=True)
         try:
             cache_file.write_text(
@@ -107,6 +108,8 @@ async def scrape_job_description(
             )
         except Exception as exc:
             logger.debug("Failed to cache JD: %s", exc)
+    elif not jd:
+        logger.warning("JD scrape returned empty content: %s", url)
 
     return jd
 
@@ -118,6 +121,7 @@ async def scrape_job_descriptions_batch(
     timeout_ms: int = 15000,
     concurrency: int = 5,
     use_cache: bool = True,
+    cache_failures: bool = False,
 ) -> dict[str, str]:
     """
     Scrape job descriptions for multiple URLs in parallel.
@@ -133,6 +137,7 @@ async def scrape_job_descriptions_batch(
                 cache_dir=cache_dir,
                 timeout_ms=timeout_ms,
                 use_cache=use_cache,
+                cache_failures=cache_failures,
             )
             return (url, jd)
 
@@ -144,7 +149,11 @@ async def scrape_job_descriptions_batch(
         if isinstance(result, tuple):
             url, jd = result
             output[url] = jd
-        # Skip exceptions silently - we'll just have empty JDs for those
+            continue
+        logger.warning("JD batch scrape failed: %s", result)
+
+    for url in urls:
+        output.setdefault(url, "")
 
     logger.info(
         "Scraped %d/%d job descriptions",

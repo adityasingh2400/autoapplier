@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is unavailable on Windows only.
+    fcntl = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +41,20 @@ def _estimate_posted_at(first_seen: str, age_hours: float | None) -> str | None:
 def url_hash(url: str) -> str:
     """Generate a short hash for a URL to use as a key."""
     return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+@contextlib.contextmanager
+def _ledger_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 @dataclass(slots=True)
@@ -113,25 +134,15 @@ class JobLedger:
 
     def __init__(self, ledger_path: Path | None = None):
         self.ledger_path = ledger_path or _default_ledger_path()
+        self.lock_path = self.ledger_path.with_suffix(self.ledger_path.suffix + ".lock")
         self._jobs: dict[str, JobEntry] = {}
         self._load()
 
     def _load(self) -> None:
         """Load ledger from disk."""
-        if not self.ledger_path.exists():
-            logger.debug("Ledger file does not exist, starting fresh: %s", self.ledger_path)
-            return
-
         try:
-            data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-            jobs_data = data.get("jobs", {})
-            for key, entry_data in jobs_data.items():
-                entry = JobEntry.from_dict(entry_data)
-                if entry.posted_at is None:
-                    entry.posted_at = _estimate_posted_at(
-                        entry.first_seen, entry.age_hours_at_discovery
-                    )
-                self._jobs[key] = entry
+            with _ledger_lock(self.lock_path):
+                self._jobs = self._read_jobs_from_disk()
             logger.info("Loaded %d jobs from ledger: %s", len(self._jobs), self.ledger_path)
         except Exception as exc:
             logger.warning("Failed to load ledger, starting fresh: %s", exc)
@@ -140,13 +151,64 @@ class JobLedger:
     def save(self) -> None:
         """Persist ledger to disk."""
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "version": 1,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "jobs": {key: entry.to_dict() for key, entry in self._jobs.items()},
-        }
-        self.ledger_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        with _ledger_lock(self.lock_path):
+            latest = self._read_jobs_from_disk()
+            merged = dict(latest)
+            for key, entry in self._jobs.items():
+                existing = merged.get(key)
+                merged[key] = self._merge_entries(existing, entry) if existing else entry
+
+            data = {
+                "version": 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "jobs": {key: entry.to_dict() for key, entry in merged.items()},
+            }
+            temp_path = self.ledger_path.with_suffix(self.ledger_path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(temp_path, self.ledger_path)
+            self._jobs = merged
         logger.debug("Saved %d jobs to ledger: %s", len(self._jobs), self.ledger_path)
+
+    def _read_jobs_from_disk(self) -> dict[str, JobEntry]:
+        if not self.ledger_path.exists():
+            logger.debug("Ledger file does not exist, starting fresh: %s", self.ledger_path)
+            return {}
+
+        jobs: dict[str, JobEntry] = {}
+        data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+        jobs_data = data.get("jobs", {})
+        for key, entry_data in jobs_data.items():
+            entry = JobEntry.from_dict(entry_data)
+            if entry.posted_at is None:
+                entry.posted_at = _estimate_posted_at(entry.first_seen, entry.age_hours_at_discovery)
+            jobs[key] = entry
+        return jobs
+
+    def _merge_entries(self, existing: JobEntry, incoming: JobEntry) -> JobEntry:
+        return JobEntry(
+            url_hash=incoming.url_hash or existing.url_hash,
+            url=incoming.url or existing.url,
+            company=incoming.company or existing.company,
+            role=incoming.role or existing.role,
+            location=incoming.location or existing.location,
+            category=incoming.category or existing.category,
+            first_seen=existing.first_seen or incoming.first_seen,
+            age_hours_at_discovery=(
+                incoming.age_hours_at_discovery
+                if incoming.age_hours_at_discovery is not None
+                else existing.age_hours_at_discovery
+            ),
+            posted_at=incoming.posted_at or existing.posted_at,
+            score=incoming.score if incoming.score is not None else existing.score,
+            score_breakdown=incoming.score_breakdown or existing.score_breakdown,
+            score_reasoning=incoming.score_reasoning or existing.score_reasoning,
+            recommendation=incoming.recommendation or existing.recommendation,
+            job_description=incoming.job_description or existing.job_description,
+            jd_scraped=bool(incoming.jd_scraped or existing.jd_scraped),
+            applied=bool(existing.applied or incoming.applied),
+            applied_at=incoming.applied_at or existing.applied_at,
+            apply_status=incoming.apply_status or existing.apply_status,
+        )
 
     def has_seen(self, url: str) -> bool:
         """Check if we've already seen this job URL."""
@@ -155,6 +217,10 @@ class JobLedger:
     def get(self, url: str) -> JobEntry | None:
         """Get a job entry by URL."""
         return self._jobs.get(url_hash(url))
+
+    def get_by_hash(self, value: str) -> JobEntry | None:
+        """Get a job entry by its stored hash key."""
+        return self._jobs.get(value)
 
     def add_job(
         self,
@@ -216,7 +282,7 @@ class JobLedger:
         entry.jd_scraped = True
 
     def mark_applied(self, url: str, status: str) -> None:
-        """Mark a job as applied."""
+        """Mark a job as successfully applied or manually confirmed."""
         entry = self.get(url)
         if entry is None:
             logger.warning("Cannot mark applied for unknown job: %s", url)
@@ -224,6 +290,17 @@ class JobLedger:
         entry.applied = True
         entry.applied_at = datetime.now(timezone.utc).isoformat()
         entry.apply_status = status
+
+    def record_apply_result(self, url: str, status: str) -> None:
+        """Record an apply attempt without incorrectly hiding retryable jobs."""
+        entry = self.get(url)
+        if entry is None:
+            logger.warning("Cannot record apply result for unknown job: %s", url)
+            return
+        entry.apply_status = status
+        if status in {"success", "submitted", "manual"}:
+            entry.applied = True
+            entry.applied_at = datetime.now(timezone.utc).isoformat()
 
     def get_new_jobs(self, urls: list[str]) -> list[str]:
         """Filter a list of URLs to only those we haven't seen."""
@@ -275,6 +352,9 @@ class JobLedger:
             1 for j in self._jobs.values()
             if j.recommendation == "high_priority"
         )
+        medium = sum(1 for j in self._jobs.values() if j.recommendation == "medium")
+        low = sum(1 for j in self._jobs.values() if j.recommendation == "low")
+        skip = sum(1 for j in self._jobs.values() if j.recommendation == "skip")
         return {
             "total_jobs": total,
             "scored": scored,
@@ -282,6 +362,9 @@ class JobLedger:
             "applied": applied,
             "unapplied": total - applied,
             "high_priority": high_priority,
+            "medium": medium,
+            "low": low,
+            "skip": skip,
         }
 
     def prune_old_jobs(self, max_age_days: int = 30) -> int:

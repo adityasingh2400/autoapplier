@@ -11,7 +11,11 @@
   "school": "Your University",
   "jobPreferences": {
     "targetRoles": ["SWE Intern", "Backend Intern"],
+    "preferredLocations": ["San Francisco Bay Area", "New York City", "Seattle", "Remote"],
+    "avoidLocations": ["India", "EMEA", "APAC"],
     "companyTypes": ["startups", "remote-friendly"],
+    "targetCompanies": ["Stripe", "Databricks", "Palantir"],
+    "avoidCompanies": [],
     "comp": "Flexible"
   },
   "applicationDefaults": {
